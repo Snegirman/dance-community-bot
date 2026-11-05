@@ -8,13 +8,21 @@ version = "0.1.0"
 description = "Telegram-бот для расписания занятий и событий танцевального сообщества"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "aiogram>=3,<4",
+    "aiohttp>=3,<4",
+    "pydantic>=2,<3",
+    "pydantic-settings>=2,<3",
+]
 
 [project.scripts]
 dance-community-bot = "dance_community_bot.__main__:main"
 
 [dependency-groups]
-dev = ["ruff>=0.14,<1"]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.14,<1",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dance_community_bot"]
