@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -11,6 +12,7 @@ from aiohttp import web
 
 from dance_community_bot import __main__ as entrypoint
 from dance_community_bot.config import Settings
+from dance_community_bot.storage import Store
 
 TOKEN = "987654:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno"
 OWNER_ID = 222
@@ -28,12 +30,13 @@ class ClosingSession(AiohttpSession):
         await super().close()
 
 
-def make_settings() -> Settings:
+def make_settings(database_path: Path | None = None) -> Settings:
     return Settings(
         telegram_bot_token=TOKEN,
         telegram_owner_id=OWNER_ID,
         telegram_webhook_url=WEBHOOK_URL,
         telegram_webhook_secret=WEBHOOK_SECRET,
+        database_path=database_path or Path("data/test.sqlite3"),
     )
 
 
@@ -50,7 +53,7 @@ def test_main_runs_webhook_server_on_loopback(
 
     monkeypatch.setattr(entrypoint, "load_settings", lambda: settings)
     monkeypatch.setattr(entrypoint, "Bot", lambda token: object())
-    monkeypatch.setattr(entrypoint, "create_dispatcher", lambda owner_id: dispatcher)
+    monkeypatch.setattr(entrypoint, "create_dispatcher", lambda current_settings, store: dispatcher)
     monkeypatch.setattr(
         entrypoint,
         "create_webhook_app",
@@ -66,11 +69,12 @@ def test_main_runs_webhook_server_on_loopback(
 
 
 def test_webhook_registration_and_shutdown_close_session(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     session = ClosingSession()
     bot = Bot(token=TOKEN, session=session)
-    dispatcher = entrypoint.create_dispatcher(OWNER_ID)
+    settings = make_settings(tmp_path / "dance.sqlite3")
+    dispatcher = entrypoint.create_dispatcher(settings, Store(settings.database_path))
     lifecycle: list[str] = []
 
     async def on_startup(bot: Bot) -> None:
@@ -89,7 +93,7 @@ def test_webhook_registration_and_shutdown_close_session(
     monkeypatch.setattr(bot, "delete_webhook", delete_webhook)
 
     async def run() -> None:
-        app = entrypoint.create_webhook_app(make_settings(), bot, dispatcher)
+        app = entrypoint.create_webhook_app(settings, bot, dispatcher)
         runner = web.AppRunner(app)
         await runner.setup()
         await runner.cleanup()
@@ -109,11 +113,12 @@ def test_webhook_registration_and_shutdown_close_session(
 
 @pytest.mark.parametrize("failure_point", ["registration", "startup", "shutdown"])
 def test_webhook_lifecycle_failure_closes_session_and_dispatcher(
-    monkeypatch: pytest.MonkeyPatch, failure_point: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_point: str
 ) -> None:
     session = ClosingSession()
     bot = Bot(token=TOKEN, session=session)
-    dispatcher = entrypoint.create_dispatcher(OWNER_ID)
+    settings = make_settings(tmp_path / "dance.sqlite3")
+    dispatcher = entrypoint.create_dispatcher(settings, Store(settings.database_path))
     lifecycle: list[str] = []
 
     async def on_startup(bot: Bot) -> None:
@@ -134,7 +139,7 @@ def test_webhook_lifecycle_failure_closes_session_and_dispatcher(
     monkeypatch.setattr(bot, "set_webhook", set_webhook)
 
     async def run() -> None:
-        app = entrypoint.create_webhook_app(make_settings(), bot, dispatcher)
+        app = entrypoint.create_webhook_app(settings, bot, dispatcher)
         runner = web.AppRunner(app)
         try:
             with pytest.raises(RuntimeError, match=f"{failure_point} failed"):

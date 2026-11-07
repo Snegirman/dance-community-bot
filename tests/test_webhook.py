@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -12,6 +13,7 @@ from aiohttp.web_urldispatcher import AbstractRoute
 from dance_community_bot import __main__ as entrypoint
 from dance_community_bot.bot import HELP_TEXT, create_dispatcher
 from dance_community_bot.config import Settings
+from dance_community_bot.storage import Store
 
 TOKEN = "987654:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno"
 OWNER_ID = 222
@@ -21,12 +23,13 @@ WEBHOOK_SECRET = "test_webhook_secret"
 SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
 
 
-def make_settings() -> Settings:
+def make_settings(database_path: Path | None = None) -> Settings:
     return Settings(
         telegram_bot_token=TOKEN,
         telegram_owner_id=OWNER_ID,
         telegram_webhook_url=WEBHOOK_URL,
         telegram_webhook_secret=WEBHOOK_SECRET,
+        database_path=database_path or Path("data/test.sqlite3"),
     )
 
 
@@ -64,13 +67,14 @@ def mocked_post_request(
     return request
 
 
-def test_webhook_rejects_missing_or_wrong_secret_before_dispatch() -> None:
+def test_webhook_rejects_missing_or_wrong_secret_before_dispatch(tmp_path: Path) -> None:
     async def run() -> None:
         bot = Bot(token=TOKEN)
-        dispatcher = create_dispatcher(OWNER_ID)
+        settings = make_settings(tmp_path / "dance.sqlite3")
+        dispatcher = create_dispatcher(settings, Store(settings.database_path))
         feed_update = AsyncMock()
         dispatcher.feed_webhook_update = feed_update
-        app = entrypoint.create_webhook_app(make_settings(), bot, dispatcher)
+        app = entrypoint.create_webhook_app(settings, bot, dispatcher)
         route = find_webhook_route(app)
         try:
             for secret in (None, "wrong_secret"):
@@ -86,14 +90,15 @@ def test_webhook_rejects_missing_or_wrong_secret_before_dispatch() -> None:
 
 
 def test_help_webhook_dispatches_only_for_owner_in_private_chat(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     async def run() -> None:
         bot = Bot(token=TOKEN)
-        dispatcher = create_dispatcher(OWNER_ID)
+        settings = make_settings(tmp_path / "dance.sqlite3")
+        dispatcher = create_dispatcher(settings, Store(settings.database_path))
         make_request = AsyncMock(return_value=None)
         monkeypatch.setattr(bot.session, "make_request", make_request)
-        app = entrypoint.create_webhook_app(make_settings(), bot, dispatcher)
+        app = entrypoint.create_webhook_app(settings, bot, dispatcher)
         route = find_webhook_route(app)
         try:
             owner_request = mocked_post_request(app, make_update(), WEBHOOK_SECRET)
@@ -117,13 +122,14 @@ def test_help_webhook_dispatches_only_for_owner_in_private_chat(
     asyncio.run(run())
 
 
-def test_webhook_does_not_acknowledge_handler_failure_as_success() -> None:
+def test_webhook_does_not_acknowledge_handler_failure_as_success(tmp_path: Path) -> None:
     async def run() -> None:
         bot = Bot(token=TOKEN)
-        dispatcher = create_dispatcher(OWNER_ID)
+        settings = make_settings(tmp_path / "dance.sqlite3")
+        dispatcher = create_dispatcher(settings, Store(settings.database_path))
         feed_update = AsyncMock(side_effect=RuntimeError("handler failed"))
         dispatcher.feed_webhook_update = feed_update
-        app = entrypoint.create_webhook_app(make_settings(), bot, dispatcher)
+        app = entrypoint.create_webhook_app(settings, bot, dispatcher)
         route = find_webhook_route(app)
         request = mocked_post_request(app, make_update(), WEBHOOK_SECRET)
         try:

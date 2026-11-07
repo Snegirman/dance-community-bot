@@ -93,7 +93,9 @@ class SourceInput(BaseModel):
     text: str | None = None
     received_at: datetime
     telegram_file_id: str | None = None
+    is_photo: bool = False
     media_group_id: str | None = None
+    reply_to_message_id: int | None = None
 
 
 class Source(SourceInput):
@@ -101,6 +103,7 @@ class Source(SourceInput):
     status: Literal["pending", "processed", "failed"]
     error_reason: str | None = None
     poster_path: Path | None = None
+    attachment_status: Literal["none", "pending", "saved", "failed", "removed"]
 
     @field_validator("poster_path")
     @classmethod
@@ -131,3 +134,45 @@ class Record(BaseModel):
     data: CardData
     poster_source_id: int | None
     status: Literal["pending", "active", "cancelled"]
+
+
+CardActionName = Literal[
+    "confirm",
+    "edit",
+    "reject",
+    "cancel",
+    "retry_poster",
+    "remove_poster",
+    "events_page",
+    "view",
+]
+
+
+class CardBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chat_id: int
+    bot_message_id: int
+    record_id: int | None = None
+    draft_id: int | None = None
+    version: int | None = None
+    revision: int | None = None
+    source_id: int | None = None
+    page: int | None = None
+
+
+class CardAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str
+    action: CardActionName
+    chat_id: int | None = None
+    bot_message_id: int | None = None
+    record_id: int | None = None
+    draft_id: int | None = None
+    version: int | None = None
+    revision: int | None = None
+    source_id: int | None = None
+    page: int | None = None
+    completed: bool = False
+    outcome: str | None = None

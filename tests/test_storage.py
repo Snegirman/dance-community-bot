@@ -60,6 +60,76 @@ def test_initialize_can_apply_migrations_repeatedly(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_initialize_upgrades_existing_v1_catalog_and_is_idempotent(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "legacy.sqlite3"
+        initial_schema = (
+            Path(__file__).parents[1]
+            / "src"
+            / "dance_community_bot"
+            / "migrations"
+            / "001_initial.sql"
+        ).read_text(encoding="utf-8")
+        source = make_source(1, "Событие до обновления")
+        data = make_event("Сохранённое событие")
+        with closing(sqlite3.connect(database)) as connection:
+            connection.executescript(initial_schema)
+            connection.execute("PRAGMA user_version = 1")
+            connection.execute(
+                "INSERT INTO sources "
+                "(id, chat_id, message_id, text, received_at, status) "
+                "VALUES (?, ?, ?, ?, ?, 'processed')",
+                (
+                    1,
+                    source.chat_id,
+                    source.message_id,
+                    source.text,
+                    source.received_at.isoformat(),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO records "
+                "(id, revision, data_type, data_json, status) "
+                "VALUES (1, 1, 'event', ?, 'active')",
+                (data.model_dump_json(),),
+            )
+            connection.execute(
+                "INSERT INTO drafts "
+                "(id, record_id, version, base_revision, data_type, data_json, "
+                "source_id, status) "
+                "VALUES (1, 1, 1, NULL, 'event', ?, 1, 'confirmed')",
+                (data.model_dump_json(),),
+            )
+            connection.commit()
+
+        store = Store(database)
+        await store.initialize()
+        await store.initialize()
+
+        restored_source = await store.get_source(source.chat_id, source.message_id)
+        restored_record = await store.get_record(1)
+        restored_draft = await store.get_draft(1)
+        action = await store.create_card_action("view", record_id=1, revision=1)
+        await store.bind_card_actions(source.chat_id, 101, [action.token])
+        bound_action = await store.get_card_action(action.token)
+        with closing(sqlite3.connect(database)) as connection:
+            version_row = connection.execute("PRAGMA user_version").fetchone()
+
+        assert restored_source is not None
+        assert restored_source.status == "processed"
+        assert restored_source.attachment_status == "none"
+        assert not restored_source.is_photo
+        assert restored_record is not None and restored_record.data == data
+        assert restored_draft is not None and restored_draft.status == "confirmed"
+        assert restored_draft.data == data
+        assert bound_action is not None
+        assert bound_action.chat_id == source.chat_id
+        assert bound_action.bot_message_id == 101
+        assert version_row == (2,)
+
+    asyncio.run(scenario())
+
+
 def test_retry_after_source_only_crash_creates_one_record(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = Store(tmp_path / "dance.sqlite3")
@@ -103,6 +173,24 @@ def test_two_concurrent_confirmations_create_one_revision(tmp_path: Path) -> Non
         assert first == second
         assert first.revision == 1
         assert await store.list_records() == [first]
+
+    asyncio.run(scenario())
+
+
+def test_draft_with_unfinished_poster_cannot_be_confirmed(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        await store.initialize()
+        source = await store.save_source(
+            make_source(1).model_copy(update={"telegram_file_id": "poster-file-id"})
+        )
+        draft = await store.save_draft(source.id, make_event(), poster_source_id=source.id)
+
+        with pytest.raises(ValueError, match="афиш"):
+            await store.confirm_draft(draft.id, draft.version)
+
+        assert await store.get_draft(draft.id) == draft
+        assert await store.list_records() == []
 
     asyncio.run(scenario())
 
@@ -198,6 +286,9 @@ def test_source_identity_preserves_original_and_allows_matching_content(tmp_path
         assert len({original.id, another_message.id, another_chat.id}) == 3
         records = []
         for source in (original, another_message, another_chat):
+            poster_path = Path("posters") / f"{source.id}.jpg"
+            (store.path.parent / poster_path).write_bytes(b"saved poster")
+            await store.set_source_poster_path(source.id, poster_path)
             draft = await store.save_draft(source.id, make_event(), poster_source_id=source.id)
             records.append(await store.confirm_draft(draft.id, draft.version))
         assert await Store(store.path).list_records() == records

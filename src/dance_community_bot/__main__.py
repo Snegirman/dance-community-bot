@@ -10,6 +10,7 @@ from aiohttp import web
 
 from dance_community_bot.bot import create_dispatcher
 from dance_community_bot.config import Settings, SettingsError, load_settings
+from dance_community_bot.storage import Store
 
 WEBHOOK_HOST = "127.0.0.1"
 
@@ -54,7 +55,8 @@ def main() -> int:
         return 1
 
     bot = Bot(token=settings.telegram_bot_token.get_secret_value())
-    dispatcher = create_dispatcher(settings.telegram_owner_id)
+    store = Store(settings.database_path)
+    dispatcher = create_dispatcher(settings, store)
     app = create_webhook_app(settings, bot, dispatcher)
     web.run_app(app, host=WEBHOOK_HOST, port=settings.webhook_port)
     return 0
