@@ -1,6 +1,7 @@
 """Загрузка и проверка обязательных настроек Telegram-бота."""
 
 import re
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from pydantic import SecretStr, ValidationError, field_validator
@@ -19,6 +20,7 @@ class Settings(BaseSettings):
     telegram_webhook_url: str
     telegram_webhook_secret: SecretStr
     webhook_port: int = 8080
+    database_path: Path = Path("data/dance-community-bot.sqlite3")
 
     @field_validator("telegram_bot_token")
     @classmethod

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import date, time
+from datetime import date, datetime, time
+from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
@@ -78,3 +80,54 @@ class ClassData(BaseModel):
         if self.last_date is not None and self.last_date < self.first_date:
             raise ValueError("Последняя дата не может быть раньше первой даты.")
         return self
+
+
+CardData = EventData | ClassData
+
+
+class SourceInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chat_id: int
+    message_id: int
+    text: str | None = None
+    received_at: datetime
+    telegram_file_id: str | None = None
+    media_group_id: str | None = None
+
+
+class Source(SourceInput):
+    id: int
+    status: Literal["pending", "processed", "failed"]
+    error_reason: str | None = None
+    poster_path: Path | None = None
+
+    @field_validator("poster_path")
+    @classmethod
+    def validate_relative_poster_path(cls, path: Path | None) -> Path | None:
+        if path is not None and (path.is_absolute() or ".." in path.parts):
+            raise ValueError("Путь афиши должен быть относительным.")
+        return path
+
+
+class Draft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    record_id: int
+    version: int
+    base_revision: int | None
+    data: CardData
+    source_id: int
+    poster_source_id: int | None
+    status: Literal["pending", "confirmed", "rejected", "superseded"]
+
+
+class Record(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    revision: int
+    data: CardData
+    poster_source_id: int | None
+    status: Literal["pending", "active", "cancelled"]

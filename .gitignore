@@ -9,6 +9,7 @@ __pycache__/
 .uv-cache/
 .python/
 .tools/
+.superpowers/
 
 # Builds and coverage
 build/

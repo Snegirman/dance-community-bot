@@ -34,6 +34,7 @@ def test_required_settings_load_from_dotenv_and_environment(
         "OPENAI_API_KEY",
         "OPENAI_MODEL",
         "WEEKLY_PUBLICATION_TIME",
+        "DATABASE_PATH",
     ):
         monkeypatch.delenv(key, raising=False)
     if source == "dotenv":
@@ -42,7 +43,8 @@ def test_required_settings_load_from_dotenv_and_environment(
             "TELEGRAM_OWNER_ID=111\n"
             "TELEGRAM_WEBHOOK_URL=https://dance.example.org/telegram/webhook\n"
             "TELEGRAM_WEBHOOK_SECRET=dotenv_hook_secret\n"
-            "OPENAI_API_KEY=\nTELEGRAM_GROUP_ID=\nWEEKLY_PUBLICATION_TIME=\n",
+            "OPENAI_API_KEY=\nTELEGRAM_GROUP_ID=\nWEEKLY_PUBLICATION_TIME=\n"
+            "DATABASE_PATH=data/from-dotenv.sqlite3\n",
             encoding="utf-8",
         )
     else:
@@ -50,6 +52,7 @@ def test_required_settings_load_from_dotenv_and_environment(
         monkeypatch.setenv("TELEGRAM_OWNER_ID", "111")
         monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://dance.example.org/telegram/webhook")
         monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "dotenv_hook_secret")
+        monkeypatch.setenv("DATABASE_PATH", "data/from-environment.sqlite3")
 
     settings = load_settings()
 
@@ -58,6 +61,9 @@ def test_required_settings_load_from_dotenv_and_environment(
     assert settings.telegram_webhook_url == "https://dance.example.org/telegram/webhook"
     assert settings.telegram_webhook_secret.get_secret_value() == "dotenv_hook_secret"
     assert settings.webhook_port == 8080
+    assert settings.database_path == Path(
+        "data/from-dotenv.sqlite3" if source == "dotenv" else "data/from-environment.sqlite3"
+    )
 
 
 def test_load_settings_reads_dotenv_and_environment_overrides_it(
