@@ -1,0 +1,427 @@
+import asyncio
+import sqlite3
+from collections.abc import AsyncGenerator, Generator, Mapping, Sequence
+from contextlib import closing, contextmanager
+from datetime import UTC, date, datetime, time
+from pathlib import Path
+
+import pytest
+from aiogram import Bot
+from aiogram.methods import SendMessage
+from aiogram.types import CallbackQuery, Chat, Message, PhotoSize, User
+from telegram_transport import RecordingSession
+
+from dance_community_bot.cards import show_source
+from dance_community_bot.intake import handle_card_action, ingest_message
+from dance_community_bot.models import (
+    CardBinding,
+    ChangeSeries,
+    ClassData,
+    EndSeries,
+    SeriesVersion,
+    SourceInput,
+    TransferOccurrence,
+)
+from dance_community_bot.schedule import expand_schedule
+from dance_community_bot.storage import Store
+
+NOW = datetime(2026, 11, 9, 9, tzinfo=UTC)
+
+
+async def saved_series(store: Store) -> int:
+    await store.initialize()
+    source = await store.save_source(
+        SourceInput(chat_id=111, message_id=1, text="Занятие", received_at=NOW)
+    )
+    draft = await store.save_draft(
+        source.id,
+        ClassData(title="Popping", first_date=date(2026, 11, 10), start_time=time(19)),
+        None,
+    )
+    record = await store.confirm_draft(draft.id, draft.version)
+    return record.id
+
+
+def test_maximum_last_date_does_not_break_an_ordinary_week() -> None:
+    version = SeriesVersion(
+        series_id=1,
+        revision=1,
+        effective_from=date(2026, 11, 10),
+        data=ClassData(
+            title="Popping",
+            first_date=date(2026, 11, 10),
+            last_date=date.max,
+            start_time=time(19),
+        ),
+    )
+
+    occurrences = expand_schedule([version], [], date(2026, 11, 9))
+
+    assert [item.actual_date for item in occurrences] == [date(2026, 11, 10)]
+
+
+def test_unrepresentable_week_end_gives_domain_error() -> None:
+    with pytest.raises(ValueError, match="Границы недели"):
+        expand_schedule([], [], date(9999, 12, 27))
+
+
+@pytest.mark.parametrize(
+    ("last_date", "expected_dates"),
+    [(date(2026, 11, 9), []), (date(2026, 11, 11), [date(2026, 11, 10)])],
+)
+def test_series_can_end_on_a_day_without_an_occurrence(
+    tmp_path: Path, last_date: date, expected_dates: list[date]
+) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        series_id = await saved_series(store)
+        draft = await store.propose_schedule_change(
+            EndSeries(
+                action="end_series",
+                series_id=series_id,
+                expected_revision=1,
+                last_date=last_date,
+            ),
+            NOW,
+        )
+        await store.confirm_schedule_change(draft.id, draft.version, NOW)
+        versions, exceptions = await store.get_schedule()
+        assert [
+            item.actual_date for item in expand_schedule(versions, exceptions, date(2026, 11, 9))
+        ] == expected_dates
+        assert expand_schedule(versions, exceptions, date(2026, 11, 16)) == []
+
+    asyncio.run(scenario())
+
+
+def test_correcting_saved_schedule_source_keeps_series_and_original_poster(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        series_id = await saved_series(store)
+        session = RecordingSession(111)
+        bot = Bot(token="987654:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno", session=session)
+        await store.bind_card_message(
+            CardBinding(
+                chat_id=111,
+                bot_message_id=101,
+                schedule_action="change_series",
+                schedule_series_id=series_id,
+                schedule_revision=1,
+            )
+        )
+        chat = Chat(id=111, type="private")
+        original = Message(
+            message_id=2,
+            date=NOW,
+            chat=chat,
+            caption="Ошибочный шаблон",
+            photo=[PhotoSize(file_id="poster", file_unique_id="unique", width=20, height=20)],
+            reply_to_message=Message(message_id=101, date=NOW, chat=chat),
+        ).as_(bot)
+        await ingest_message(original, store)
+        source = await store.get_source(111, 2)
+        assert source is not None and source.status == "failed"
+        await show_source(original, source, store)
+        source_card_id = 100 + len(session.messages)
+        corrected = Message(
+            message_id=3,
+            date=NOW,
+            chat=chat,
+            text=(
+                "Действует с: 01.12.2099\nНазвание: Waving\nПервая дата: 01.12.2099\nВремя: 21:00"
+            ),
+            reply_to_message=Message(message_id=source_card_id, date=NOW, chat=chat),
+        ).as_(bot)
+        await ingest_message(corrected, Store(store.path))
+        actions = [
+            await store.get_card_action(button.callback_data.removeprefix("a:"))
+            for request in session.requests
+            if isinstance(request, SendMessage) and request.reply_markup is not None
+            for row in request.reply_markup.inline_keyboard
+            for button in row
+            if button.callback_data is not None and button.text == "Подтвердить изменение серии"
+        ]
+        assert len(actions) == 1
+        action = actions[0]
+        assert action is not None and action.schedule_draft_id is not None
+        assert action.schedule_draft_version is not None
+        await store.confirm_schedule_change(
+            action.schedule_draft_id, action.schedule_draft_version, NOW
+        )
+        records = await store.list_records()
+        assert len(records) == 1 and records[0].id == series_id
+        assert records[0].data.title == "Waving"
+        assert records[0].poster_source_id == source.id
+        assert len(await store.list_drafts()) == 1
+        original_source = await store.get_source_by_id(source.id)
+        assert original_source is not None and original_source.status == "processed"
+        assert original_source.poster_path is not None
+        assert (tmp_path / original_source.poster_path).read_bytes() == session.poster_bytes
+        await bot.session.close()
+
+    asyncio.run(scenario())
+
+
+def test_schedule_poster_retry_after_restart_restores_the_same_change(tmp_path: Path) -> None:
+    class FailedDownloadSession(RecordingSession):
+        async def stream_content(
+            self,
+            url: str,
+            headers: dict[str, str] | None = None,
+            timeout: int = 30,
+            chunk_size: int = 65536,
+            raise_for_status: bool = True,
+        ) -> AsyncGenerator[bytes]:
+            raise OSError("test download failure")
+            yield b""
+
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        series_id = await saved_series(store)
+        session = FailedDownloadSession(111)
+        bot = Bot(token="987654:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno", session=session)
+        await store.bind_card_message(
+            CardBinding(
+                chat_id=111,
+                bot_message_id=101,
+                schedule_action="change_series",
+                schedule_series_id=series_id,
+                schedule_revision=1,
+            )
+        )
+        chat = Chat(id=111, type="private")
+        message = Message(
+            message_id=2,
+            date=NOW,
+            chat=chat,
+            caption=(
+                "Действует с: 01.12.2099\nНазвание: Waving\nПервая дата: 01.12.2099\nВремя: 21:00"
+            ),
+            photo=[PhotoSize(file_id="poster", file_unique_id="unique", width=20, height=20)],
+            reply_to_message=Message(message_id=101, date=NOW, chat=chat),
+        ).as_(bot)
+        await ingest_message(message, store)
+        source = await store.get_source(111, 2)
+        assert source is not None and source.attachment_status == "failed"
+        retry = next(
+            button.callback_data
+            for request in session.requests
+            if isinstance(request, SendMessage) and request.reply_markup is not None
+            for row in request.reply_markup.inline_keyboard
+            for button in row
+            if button.text == "Повторить загрузку афиши"
+        )
+        assert retry is not None
+        action = await store.get_card_action(retry.removeprefix("a:"))
+        assert action is not None and action.bot_message_id is not None
+        await bot.session.close()
+        restored_session = RecordingSession(111)
+        restored_bot = Bot(
+            token="987654:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno", session=restored_session
+        )
+        callback = CallbackQuery(
+            id="retry",
+            from_user=User(id=111, is_bot=False, first_name="Владелец"),
+            chat_instance="private",
+            data=retry,
+            message=Message(message_id=action.bot_message_id, date=NOW, chat=chat).as_(
+                restored_bot
+            ),
+        ).as_(restored_bot)
+        await handle_card_action(callback, Store(store.path))
+        restored_source = await store.get_source_by_id(source.id)
+        assert restored_source is not None and restored_source.attachment_status == "saved"
+        assert restored_source.status == "processed"
+        assert "новое расписание" in "\n".join(restored_session.messages)
+        assert len(await store.list_records()) == 1
+        assert len(await store.list_drafts()) == 1
+        versions, _ = await store.get_schedule()
+        assert len(versions) == 1 and versions[0].data.title == "Popping"
+        await restored_bot.session.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("explicit_date", [False, True])
+def test_reply_to_confirmed_class_uses_dated_schedule_and_keeps_photo(
+    tmp_path: Path, explicit_date: bool
+) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        series_id = await saved_series(store)
+        session = RecordingSession(111)
+        bot = Bot(token="987654:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno", session=session)
+        await store.bind_card_message(
+            CardBinding(chat_id=111, bot_message_id=101, record_id=series_id, revision=1)
+        )
+        text = "Название: Waving\nПервая дата: 01.12.2099\nВремя: 21:00"
+        if explicit_date:
+            text = "Действует с: 01.12.2099\n" + text
+        message = Message(
+            message_id=2,
+            date=NOW,
+            chat=Chat(id=111, type="private"),
+            caption=text,
+            photo=[PhotoSize(file_id="poster", file_unique_id="unique", width=20, height=20)],
+            reply_to_message=Message(message_id=101, date=NOW, chat=Chat(id=111, type="private")),
+        ).as_(bot)
+
+        await ingest_message(message, store)
+
+        source = await store.get_source(111, 2)
+        assert source is not None and source.text == text
+        assert source.attachment_status == "saved" and source.poster_path is not None
+        assert (tmp_path / source.poster_path).read_bytes() == session.poster_bytes
+        assert len(await store.list_drafts()) == 1
+        record = await store.get_record(series_id)
+        assert record is not None and record.revision == 1
+        if explicit_date:
+            previews = [
+                request
+                for request in session.requests
+                if isinstance(request, SendMessage) and "новое расписание" in request.text
+            ]
+            assert len(previews) == 1 and "01.12.2099" in previews[0].text
+            assert source.status == "processed"
+        else:
+            assert source.status == "failed"
+            assert "Действует с" in "\n".join(session.messages)
+        await bot.session.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("with_button_revisions", [False, True])
+def test_schedule_read_keeps_one_snapshot_across_concurrent_confirmation(
+    tmp_path: Path, with_button_revisions: bool
+) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        series_id = await saved_series(store)
+        with closing(sqlite3.connect(store.path)) as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
+        transfer = await store.propose_schedule_change(
+            TransferOccurrence(
+                action="transfer_occurrence",
+                series_id=series_id,
+                expected_revision=1,
+                original_date=date(2026, 11, 10),
+                new_date=date(2026, 11, 18),
+                new_time=time(20),
+            ),
+            NOW,
+        )
+        await store.confirm_schedule_change(transfer.id, transfer.version, NOW)
+        replacement = await store.propose_schedule_change(
+            ChangeSeries(
+                action="change_series",
+                series_id=series_id,
+                expected_revision=1,
+                effective_from=date(2026, 11, 17),
+                data=ClassData(title="Waving", first_date=date(2026, 11, 17), start_time=time(21)),
+                resolutions={date(2026, 11, 10): "remove"},
+            ),
+            NOW,
+        )
+
+        class InterleavedConnection(sqlite3.Connection):
+            def execute(
+                self, sql: str, parameters: Sequence[object] | Mapping[str, object] = ()
+            ) -> sqlite3.Cursor:
+                if "FROM schedule_exceptions WHERE archived = 0" in sql:
+                    store._confirm_schedule_change_sync(replacement.id, replacement.version, NOW)
+                return super().execute(sql, parameters)
+
+        class InterleavedStore(Store):
+            @contextmanager
+            def _connection(self) -> Generator[sqlite3.Connection]:
+                connection = sqlite3.connect(
+                    self.path, isolation_level=None, factory=InterleavedConnection
+                )
+                connection.row_factory = sqlite3.Row
+                try:
+                    yield connection
+                finally:
+                    connection.close()
+
+        reader = InterleavedStore(store.path)
+        if with_button_revisions:
+            versions, exceptions, revisions, records = await reader.get_schedule_snapshot()
+            assert revisions[(series_id, date(2026, 11, 10))] == 1
+            assert len(records) == 1 and records[0].revision == 1
+        else:
+            versions, exceptions = await reader.get_schedule()
+        assert len(versions) == 1 and versions[0].effective_until is None
+        assert len(exceptions) == 1 and exceptions[0].new_date == date(2026, 11, 18)
+        assert expand_schedule(versions, exceptions, date(2026, 11, 9)) == []
+        latest_versions, latest_exceptions = await store.get_schedule()
+        assert len(latest_versions) == 2 and latest_exceptions == []
+
+    asyncio.run(scenario())
+
+
+def test_legacy_pending_class_edit_cannot_bypass_schedule_versions(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        series_id = await saved_series(store)
+        source = await store.save_source(
+            SourceInput(chat_id=111, message_id=2, text="Старая правка", received_at=NOW)
+        )
+        changed = ClassData(
+            title="Изменение без даты действия",
+            first_date=date(2026, 11, 10),
+            start_time=time(21),
+        )
+        with closing(sqlite3.connect(store.path)) as connection:
+            cursor = connection.execute(
+                "INSERT INTO drafts (record_id, version, base_revision, data_type, data_json, "
+                "source_id, status) VALUES (?, 2, 1, 'class', ?, ?, 'pending')",
+                (series_id, changed.model_dump_json(), source.id),
+            )
+            legacy_draft_id = cursor.lastrowid
+            connection.commit()
+        assert legacy_draft_id is not None
+        with pytest.raises(ValueError, match="расписани"):
+            await store.confirm_draft(legacy_draft_id, 2)
+        record = await store.get_record(series_id)
+        assert record is not None and record.revision == 1 and record.data.title == "Popping"
+        versions, _ = await store.get_schedule()
+        assert len(versions) == 1 and versions[0].data.start_time == time(19)
+
+    asyncio.run(scenario())
+
+
+def test_end_preview_keeps_version_starting_on_the_inclusive_last_date(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        series_id = await saved_series(store)
+        for revision, first_date in [(1, date(2026, 11, 17)), (2, date(2026, 11, 24))]:
+            draft = await store.propose_schedule_change(
+                ChangeSeries(
+                    action="change_series",
+                    series_id=series_id,
+                    expected_revision=revision,
+                    effective_from=first_date,
+                    data=ClassData(title="Popping", first_date=first_date, start_time=time(20)),
+                ),
+                NOW,
+            )
+            await store.confirm_schedule_change(draft.id, draft.version, NOW)
+        end = await store.propose_schedule_change(
+            EndSeries(
+                action="end_series",
+                series_id=series_id,
+                expected_revision=3,
+                last_date=date(2026, 11, 17),
+            ),
+            NOW,
+        )
+        assert [item.effective_from for item in end.superseded_versions] == [date(2026, 11, 24)]
+        await store.confirm_schedule_change(end.id, end.version, NOW)
+        versions, exceptions = await store.get_schedule()
+        week = expand_schedule(versions, exceptions, date(2026, 11, 16))
+        assert [(item.actual_date, item.start_time) for item in week] == [
+            (date(2026, 11, 17), time(20))
+        ]
+
+    asyncio.run(scenario())

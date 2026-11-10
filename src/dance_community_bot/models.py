@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class EventData(BaseModel):
@@ -82,6 +82,163 @@ class ClassData(BaseModel):
         return self
 
 
+class SeriesVersion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    series_id: int
+    revision: int
+    effective_from: date
+    effective_until: date | None = None
+    data: ClassData
+    poster_source_id: int | None = None
+    source_id: int | None = None
+
+    @model_validator(mode="after")
+    def validate_interval(self) -> SeriesVersion:
+        if self.revision < 1:
+            raise ValueError("Ревизия расписания должна быть положительной.")
+        if self.data.first_date < self.effective_from:
+            raise ValueError("Первая дата занятия не может быть раньше начала версии.")
+        if self.effective_until is not None and self.effective_until <= self.effective_from:
+            raise ValueError("Конец версии должен быть позже её начала.")
+        if self.data.last_date is not None and self.effective_from > self.data.last_date:
+            raise ValueError("Версия расписания не содержит возможных занятий.")
+        return self
+
+
+class ScheduleException(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    series_id: int
+    original_date: date
+    revision: int
+    cancelled: bool = False
+    new_date: date | None = None
+    new_time: time | None = None
+    place: str | None = None
+    source_id: int | None = None
+    archived: bool = False
+
+    @field_validator("place", mode="before")
+    @classmethod
+    def normalize_place(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @model_validator(mode="after")
+    def validate_transfer(self) -> ScheduleException:
+        if self.revision < 1:
+            raise ValueError("Ревизия исключения должна быть положительной.")
+        if (self.new_date is None) != (self.new_time is None):
+            raise ValueError("Для переноса укажите дату и время вместе.")
+        if not self.cancelled and self.new_date is None:
+            raise ValueError("Перенос должен содержать новую дату и время.")
+        return self
+
+
+class Occurrence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    series_id: int
+    original_date: date
+    actual_date: date
+    start_time: time
+    title: str
+    place: str | None
+    price: str | None
+    description: str | None
+    poster_source_id: int | None
+    cancelled: bool = False
+    warnings: tuple[str, ...] = ()
+
+
+class OccurrenceChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    series_id: int = Field(gt=0)
+    expected_revision: int = Field(gt=0)
+    original_date: date
+    expected_exception_revision: int | None = Field(default=None, gt=0)
+    source_id: int | None = None
+
+
+class CancelOccurrence(OccurrenceChange):
+    action: Literal["cancel_occurrence"]
+
+
+class TransferOccurrence(OccurrenceChange):
+    action: Literal["transfer_occurrence"]
+    new_date: date
+    new_time: time
+    place: str | None = None
+
+    @field_validator("place", mode="before")
+    @classmethod
+    def normalize_place(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+
+class RemoveException(OccurrenceChange):
+    action: Literal["remove_exception"]
+
+
+ScheduleResolution = Literal["remove", "detach"]
+
+
+class ChangeSeries(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["change_series"]
+    series_id: int = Field(gt=0)
+    expected_revision: int = Field(gt=0)
+    effective_from: date
+    data: ClassData
+    source_id: int | None = None
+    poster_source_id: int | None = None
+    remove_poster: bool = False
+    resolutions: dict[date, ScheduleResolution] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_first_date(self) -> ChangeSeries:
+        if self.data.first_date < self.effective_from:
+            raise ValueError("Первая дата нового расписания не может быть раньше даты действия.")
+        if self.remove_poster and self.poster_source_id is not None:
+            raise ValueError("Нельзя одновременно заменить и убрать афишу.")
+        return self
+
+
+class EndSeries(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["end_series"]
+    series_id: int = Field(gt=0)
+    expected_revision: int = Field(gt=0)
+    last_date: date
+    source_id: int | None = None
+    resolutions: dict[date, ScheduleResolution] = Field(default_factory=dict)
+
+
+ScheduleChange = Annotated[
+    CancelOccurrence | TransferOccurrence | RemoveException | ChangeSeries | EndSeries,
+    Field(discriminator="action"),
+]
+
+
+class ChangeDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    version: int
+    base_revision: int
+    change: ScheduleChange
+    affected_exceptions: list[ScheduleException] = Field(default_factory=list)
+    superseded_versions: list[SeriesVersion] = Field(default_factory=list)
+    status: Literal["pending", "confirmed", "superseded"] = "pending"
+
+
 CardData = EventData | ClassData
 
 
@@ -145,6 +302,15 @@ CardActionName = Literal[
     "remove_poster",
     "events_page",
     "view",
+    "schedule_cancel",
+    "schedule_transfer",
+    "schedule_remove_exception",
+    "schedule_change_series",
+    "schedule_end_series",
+    "schedule_confirm",
+    "schedule_resolve_remove",
+    "schedule_resolve_detach",
+    "schedule_cancel_draft",
 ]
 
 
@@ -159,6 +325,13 @@ class CardBinding(BaseModel):
     revision: int | None = None
     source_id: int | None = None
     page: int | None = None
+    schedule_action: str | None = None
+    schedule_series_id: int | None = None
+    schedule_revision: int | None = None
+    schedule_original_date: date | None = None
+    expected_exception_revision: int | None = None
+    schedule_draft_id: int | None = None
+    schedule_draft_version: int | None = None
 
 
 class CardAction(BaseModel):
@@ -174,5 +347,12 @@ class CardAction(BaseModel):
     revision: int | None = None
     source_id: int | None = None
     page: int | None = None
+    series_id: int | None = None
+    schedule_revision: int | None = None
+    original_date: date | None = None
+    expected_exception_revision: int | None = None
+    schedule_draft_id: int | None = None
+    schedule_draft_version: int | None = None
+    remove_poster: bool = False
     completed: bool = False
     outcome: str | None = None

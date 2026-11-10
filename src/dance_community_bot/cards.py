@@ -195,6 +195,13 @@ async def _action_button(
     revision: int | None = None,
     source_id: int | None = None,
     page: int | None = None,
+    series_id: int | None = None,
+    schedule_revision: int | None = None,
+    original_date: date | None = None,
+    expected_exception_revision: int | None = None,
+    schedule_draft_id: int | None = None,
+    schedule_draft_version: int | None = None,
+    remove_poster: bool = False,
 ) -> InlineKeyboardButton:
     action = await store.create_card_action(
         action_name,
@@ -204,6 +211,13 @@ async def _action_button(
         revision=revision,
         source_id=source_id,
         page=page,
+        series_id=series_id,
+        schedule_revision=schedule_revision,
+        original_date=original_date,
+        expected_exception_revision=expected_exception_revision,
+        schedule_draft_id=schedule_draft_id,
+        schedule_draft_version=schedule_draft_version,
+        remove_poster=remove_poster,
     )
     return InlineKeyboardButton(text=label, callback_data=f"a:{action.token}")
 
@@ -315,36 +329,64 @@ async def show_draft(message: Message, draft: Draft, store: Store) -> None:
 async def show_record(message: Message, record: Record, store: Store) -> None:
     rows: list[list[InlineKeyboardButton]] = []
     if record.status == "active":
-        row = [
-            await _action_button(
-                store,
-                "Исправить",
-                "edit",
-                record_id=record.id,
-                revision=record.revision,
-            )
-        ]
-        row.append(
-            await _action_button(
-                store,
-                "Отменить",
-                "cancel",
-                record_id=record.id,
-                revision=record.revision,
-            )
-        )
-        if record.poster_source_id is not None:
-            row.append(
+        if isinstance(record.data, ClassData):
+            row = [
                 await _action_button(
                     store,
-                    "Убрать афишу",
-                    "remove_poster",
+                    "Изменить расписание",
+                    "schedule_change_series",
+                    series_id=record.id,
+                    schedule_revision=record.revision,
+                ),
+                await _action_button(
+                    store,
+                    "Завершить серию",
+                    "schedule_end_series",
+                    series_id=record.id,
+                    schedule_revision=record.revision,
+                ),
+            ]
+            if record.poster_source_id is not None:
+                row.append(
+                    await _action_button(
+                        store,
+                        "Убрать афишу",
+                        "schedule_change_series",
+                        series_id=record.id,
+                        schedule_revision=record.revision,
+                        remove_poster=True,
+                    )
+                )
+            rows.append(row)
+        else:
+            row = [
+                await _action_button(
+                    store,
+                    "Исправить",
+                    "edit",
                     record_id=record.id,
                     revision=record.revision,
-                    source_id=record.poster_source_id,
+                ),
+                await _action_button(
+                    store,
+                    "Отменить",
+                    "cancel",
+                    record_id=record.id,
+                    revision=record.revision,
+                ),
+            ]
+            if record.poster_source_id is not None:
+                row.append(
+                    await _action_button(
+                        store,
+                        "Убрать афишу",
+                        "remove_poster",
+                        record_id=record.id,
+                        revision=record.revision,
+                        source_id=record.poster_source_id,
+                    )
                 )
-            )
-        rows.append(row)
+            rows.append(row)
     keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
     poster = "Афиша: добавлена" if record.poster_source_id is not None else "Афиша: не добавлена"
     status = "Статус: Отменена\n" if record.status == "cancelled" else ""
@@ -391,7 +433,9 @@ async def show_source(message: Message, source: Source, store: Store) -> None:
         if source.reply_to_message_id is not None
         else None
     )
-    if reply_binding is not None and reply_binding.record_id is not None:
+    if reply_binding is not None and (
+        reply_binding.record_id is not None or reply_binding.schedule_action is not None
+    ):
         binding = reply_binding.model_copy(update={"bot_message_id": 0, "source_id": source.id})
     else:
         binding = CardBinding(

@@ -14,11 +14,13 @@ from .models import (
     CardAction,
     CardBinding,
     CardData,
+    ClassData,
     Draft,
     EventData,
     Source,
     SourceInput,
 )
+from .schedule_handlers import handle_schedule_action, handle_schedule_reply
 from .storage import Store
 from .templates import TemplateError, parse_class_template, parse_event_template
 
@@ -295,10 +297,28 @@ async def _process_source(
         await store.set_source_error(source.id, reason)
         await _show_source_error(message, await store.get_source_by_id(source.id) or source, store)
         return
-    if message.document is not None:
+    if source.telegram_file_id is not None and not source.is_photo:
         reason = "Документы не поддерживаются как афиша. Отправьте одну фотографию."
         await store.set_source_error(source.id, reason)
         await _show_source_error(message, await store.get_source_by_id(source.id) or source, store)
+        return
+
+    if (
+        context is not None
+        and isinstance(context.data, ClassData)
+        and context.base_revision is not None
+        and source.reply_to_message_id is not None
+    ):
+        await store.bind_card_message(
+            CardBinding(
+                chat_id=source.chat_id,
+                bot_message_id=source.reply_to_message_id,
+                schedule_action="change_series",
+                schedule_series_id=context.record_id,
+                schedule_revision=context.base_revision,
+            )
+        )
+        await _handle_schedule_source(message, source, store)
         return
 
     data: CardData | None = None
@@ -363,14 +383,46 @@ async def ingest_message(message: Message, store: Store) -> None:
     source_input = _source_input(message)
     existing = await store.get_source(source_input.chat_id, source_input.message_id)
     if existing is not None:
+        if await _handle_schedule_source(message, existing, store):
+            return
         await _repeat_source(message, existing, store)
         return
 
     source = await store.save_source(source_input)
+    if await _handle_schedule_source(message, source, store):
+        return
     if message.media_group_id is None:
         await _process_source(message, source, store, resolve_reply=True)
     else:
         await _process_source(message, source, store, resolve_reply=False)
+
+
+async def _handle_schedule_source(message: Message, source: Source, store: Store) -> bool:
+    if source.media_group_id is not None or (
+        source.telegram_file_id is not None and not source.is_photo
+    ):
+        return False
+    if source.reply_to_message_id is None:
+        return False
+    binding = await store.get_card_binding(source.chat_id, source.reply_to_message_id)
+    if binding is None or binding.schedule_action is None:
+        return False
+    poster = source if source.is_photo else None
+    if poster is None and binding.schedule_action == "change_series" and binding.source_id:
+        poster = await store.get_source_by_id(binding.source_id)
+    poster_source_id: int | None = None
+    if poster is not None and poster.is_photo and poster.attachment_status != "removed":
+        if not await _download_poster(message, poster, store):
+            await store.set_source_error(source.id, _POSTER_ERROR)
+            await show_source(message, await store.get_source_by_id(source.id) or source, store)
+            return True
+        poster_source_id = poster.id
+    handled = await handle_schedule_reply(message, source, store, poster_source_id=poster_source_id)
+    if poster_source_id is not None and poster_source_id != source.id:
+        processed = await store.get_source_by_id(source.id)
+        if processed is not None and processed.status == "processed":
+            await store.mark_source_processed(poster_source_id)
+    return handled
 
 
 async def handle_card_action(callback: CallbackQuery, store: Store) -> None:
@@ -398,7 +450,11 @@ async def handle_card_action(callback: CallbackQuery, store: Store) -> None:
         return
 
     try:
-        outcome = await _apply_card_action(message, action, store)
+        if action.action.startswith("schedule_"):
+            outcome = await handle_schedule_action(message, action, store)
+            await store.complete_card_action(action.token, outcome)
+        else:
+            outcome = await _apply_card_action(message, action, store)
     except ValueError as error:
         outcome = str(error)
         await message.answer(outcome)
@@ -481,6 +537,8 @@ async def _apply_card_action(message: Message, action: CardAction, store: Store)
                 for draft in await store.list_drafts()
             ):
                 raise ValueError("Источник уже связан с карточкой. Откройте /events.")
+            if await _handle_schedule_source(message, source, store):
+                return "Состояние вложения обновлено."
             await _process_source(message, source, store, resolve_reply=True)
             return "Состояние вложения обновлено."
         draft = await store.get_draft(action.draft_id)

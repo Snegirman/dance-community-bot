@@ -125,7 +125,7 @@ def test_initialize_upgrades_existing_v1_catalog_and_is_idempotent(tmp_path: Pat
         assert bound_action is not None
         assert bound_action.chat_id == source.chat_id
         assert bound_action.bot_message_id == 101
-        assert version_row == (2,)
+        assert version_row == (3,)
 
     asyncio.run(scenario())
 

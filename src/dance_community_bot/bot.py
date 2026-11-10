@@ -8,6 +8,7 @@ from dance_community_bot.access import is_owner_private
 from dance_community_bot.cards import show_events
 from dance_community_bot.config import Settings
 from dance_community_bot.intake import handle_card_action, ingest_message
+from dance_community_bot.schedule_handlers import schedule_command_handler
 from dance_community_bot.storage import Store
 
 START_TEXT = "Привет! Используйте /help, чтобы посмотреть доступные команды."
@@ -16,6 +17,7 @@ HELP_TEXT = (
     "/event — шаблон разового события\n"
     "/class — шаблон регулярного занятия\n"
     "/events — активные записи, черновики и незавершённые сообщения\n"
+    "/schedule [ДД.ММ.ГГГГ] — расписание недели и изменения серий\n"
     "/help — эта справка"
 )
 EVENT_TEMPLATE = """Название: Popping Jam
@@ -68,6 +70,10 @@ async def events_handler(message: Message, store: Store) -> None:
     await show_events(message, store)
 
 
+async def schedule_handler(message: Message, store: Store) -> None:
+    await schedule_command_handler(message, store)
+
+
 async def intake_handler(message: Message, store: Store) -> None:
     await ingest_message(message, store)
 
@@ -90,6 +96,7 @@ def create_dispatcher(settings: Settings, store: Store) -> Dispatcher:
     dispatcher.message.register(event_template_handler, Command("event"))
     dispatcher.message.register(class_template_handler, Command("class"))
     dispatcher.message.register(events_handler, Command("events"))
+    dispatcher.message.register(schedule_handler, Command("schedule"))
     dispatcher.message.register(intake_handler)
     dispatcher.edited_message.register(intake_handler)
     dispatcher.callback_query.register(card_action_handler)

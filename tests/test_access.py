@@ -17,7 +17,7 @@ from dance_community_bot.access import is_owner_private
 from dance_community_bot.bot import create_dispatcher
 from dance_community_bot.cards import show_draft
 from dance_community_bot.config import Settings
-from dance_community_bot.models import EventData, SourceInput
+from dance_community_bot.models import CardActionName, EventData, SourceInput
 from dance_community_bot.storage import Store
 
 OWNER_ID = 222
@@ -193,6 +193,7 @@ def test_commands_work_without_prior_start_and_explain_current_limits(
         ("/event", "Дата: 14.11.2026"),
         ("/class", "Первая дата: 10.11.2026"),
         ("/events", "Страница 1 из 1"),
+        ("/schedule 09.11.2026", "Расписание"),
     ],
 )
 def test_intake_commands_are_available_to_owner(
@@ -246,7 +247,7 @@ def test_owner_malformed_material_is_saved_without_creating_catalog_record(
         (None, "private"),
     ],
 )
-@pytest.mark.parametrize("text", ["материал", "/help", "/start"])
+@pytest.mark.parametrize("text", ["материал", "/help", "/start", "/schedule 09.11.2026"])
 def test_disallowed_messages_are_ignored(
     client: tuple[Bot, RecordingSession],
     app: tuple[Dispatcher, Store],
@@ -303,6 +304,54 @@ def test_owner_private_callback_reaches_handlers_after_the_access_barrier(
     feed(dispatcher, bot, make_callback_update(update_id=5))
 
     assert any(isinstance(method, AnswerCallbackQuery) for method in session.requests)
+
+
+@pytest.mark.parametrize(
+    ("user_id", "chat_type"),
+    [(OWNER_ID + 1, "private"), (OWNER_ID, "group"), (OWNER_ID, "supergroup")],
+)
+def test_all_bound_schedule_actions_require_owner_private_chat(
+    client: tuple[Bot, RecordingSession],
+    app: tuple[Dispatcher, Store],
+    user_id: int,
+    chat_type: str,
+) -> None:
+    bot, session = client
+    dispatcher, store = app
+    actions: list[CardActionName] = [
+        "schedule_cancel",
+        "schedule_transfer",
+        "schedule_remove_exception",
+        "schedule_change_series",
+        "schedule_end_series",
+        "schedule_confirm",
+        "schedule_resolve_remove",
+        "schedule_resolve_detach",
+        "schedule_cancel_draft",
+    ]
+
+    async def scenario() -> None:
+        for update_id, name in enumerate(actions, start=100):
+            update = make_callback_update(update_id=update_id, user_id=user_id, chat_type=chat_type)
+            callback = update.callback_query
+            assert callback is not None and isinstance(callback.message, Message)
+            action = await store.create_card_action(name)
+            await store.bind_card_actions(
+                callback.message.chat.id, callback.message.message_id, [action.token]
+            )
+            await dispatcher.feed_update(
+                bot,
+                update.model_copy(
+                    update={
+                        "callback_query": callback.model_copy(update={"data": f"a:{action.token}"})
+                    }
+                ),
+            )
+            stored = await store.get_card_action(action.token)
+            assert stored is not None and not stored.completed
+
+    asyncio.run(scenario())
+    assert session.requests == []
 
 
 def test_dispatcher_confirms_a_bound_card_action_for_the_owner(
