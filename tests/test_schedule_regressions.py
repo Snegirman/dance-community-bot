@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from aiogram import Bot
 from aiogram.methods import SendMessage
-from aiogram.types import CallbackQuery, Chat, Message, PhotoSize, User
+from aiogram.types import CallbackQuery, Chat, InlineKeyboardMarkup, Message, PhotoSize, User
 from telegram_transport import RecordingSession
 
 from dance_community_bot.cards import show_source
@@ -18,6 +18,8 @@ from dance_community_bot.models import (
     ChangeSeries,
     ClassData,
     EndSeries,
+    EventData,
+    RemoveException,
     SeriesVersion,
     SourceInput,
     TransferOccurrence,
@@ -123,14 +125,38 @@ def test_correcting_saved_schedule_source_keeps_series_and_original_poster(tmp_p
         assert source is not None and source.status == "failed"
         await show_source(original, source, store)
         source_card_id = 100 + len(session.messages)
+        await ingest_message(
+            Message(
+                message_id=3,
+                date=NOW,
+                chat=chat,
+                text="Ошибочная подпись",
+                reply_to_message=Message(message_id=source_card_id, date=NOW, chat=chat),
+            ).as_(bot),
+            Store(store.path),
+        )
+        bad_text_source = await store.get_source(111, 3)
+        assert bad_text_source is not None and bad_text_source.status == "failed"
+        await show_source(
+            Message(
+                message_id=3,
+                date=NOW,
+                chat=chat,
+                text="Ошибочная подпись",
+                reply_to_message=Message(message_id=source_card_id, date=NOW, chat=chat),
+            ).as_(bot),
+            bad_text_source,
+            Store(store.path),
+        )
+        bad_source_card_id = 100 + len(session.messages)
         corrected = Message(
-            message_id=3,
+            message_id=4,
             date=NOW,
             chat=chat,
             text=(
                 "Действует с: 01.12.2099\nНазвание: Waving\nПервая дата: 01.12.2099\nВремя: 21:00"
             ),
-            reply_to_message=Message(message_id=source_card_id, date=NOW, chat=chat),
+            reply_to_message=Message(message_id=bad_source_card_id, date=NOW, chat=chat),
         ).as_(bot)
         await ingest_message(corrected, Store(store.path))
         actions = [
@@ -158,6 +184,336 @@ def test_correcting_saved_schedule_source_keeps_series_and_original_poster(tmp_p
         assert original_source.poster_path is not None
         assert (tmp_path / original_source.poster_path).read_bytes() == session.poster_bytes
         await bot.session.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("last_date", [None, date(2099, 11, 17), date(2099, 11, 25)])
+def test_remove_poster_keeps_end_series_boundary_through_real_confirmation(
+    tmp_path: Path,
+    last_date: date | None,
+) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "dance.sqlite3"
+        store = Store(database)
+        await store.initialize()
+        poster = await store.save_source(
+            SourceInput(
+                chat_id=111,
+                message_id=1,
+                text="Исходная афиша",
+                received_at=NOW,
+                telegram_file_id="poster-file",
+                is_photo=True,
+            )
+        )
+        poster_path = Path("posters/class.jpg")
+        full_poster_path = database.parent / poster_path
+        await asyncio.to_thread(full_poster_path.write_bytes, b"saved poster")
+        await store.set_source_poster_path(poster.id, poster_path)
+        draft = await store.save_draft(
+            poster.id,
+            ClassData(
+                title="Popping",
+                first_date=date(2099, 11, 10),
+                last_date=last_date,
+                start_time=time(19),
+                place="Зал A",
+            ),
+            poster_source_id=poster.id,
+        )
+        series = await store.confirm_draft(draft.id, draft.version)
+        now = NOW
+        end = await store.propose_schedule_change(
+            EndSeries(
+                action="end_series",
+                series_id=series.id,
+                expected_revision=1,
+                last_date=date(2099, 11, 18),
+            ),
+            now,
+        )
+        await store.confirm_schedule_change(end.id, end.version, now)
+
+        session = RecordingSession(111)
+        bot = Bot(token="987654:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno", session=session)
+        await store.bind_card_message(
+            CardBinding(
+                chat_id=111,
+                bot_message_id=101,
+                schedule_action="remove_poster",
+                schedule_series_id=series.id,
+                schedule_revision=2,
+            )
+        )
+        chat = Chat(id=111, type="private")
+        request = Message(
+            message_id=2,
+            date=NOW,
+            chat=chat,
+            text="Действует с: 11.11.2099",
+            reply_to_message=Message(message_id=101, date=NOW, chat=chat),
+        ).as_(bot)
+        await ingest_message(request, store)
+
+        confirm_request = next(
+            request
+            for request in session.requests
+            if isinstance(request, SendMessage)
+            and isinstance(request.reply_markup, InlineKeyboardMarkup)
+            and any(
+                button.text == "Подтвердить изменение серии"
+                for row in request.reply_markup.inline_keyboard
+                for button in row
+            )
+        )
+        assert isinstance(confirm_request.reply_markup, InlineKeyboardMarkup)
+        confirm_token = next(
+            button.callback_data
+            for row in confirm_request.reply_markup.inline_keyboard
+            for button in row
+            if button.text == "Подтвердить изменение серии"
+        )
+        assert confirm_token is not None
+        action = await store.get_card_action(confirm_token.removeprefix("a:"))
+        assert action is not None and action.bot_message_id is not None
+        callback = CallbackQuery(
+            id="confirm-remove-poster",
+            from_user=User(id=111, is_bot=False, first_name="Владелец"),
+            chat_instance="private",
+            data=confirm_token,
+            message=Message(
+                message_id=action.bot_message_id,
+                date=NOW,
+                chat=chat,
+            ).as_(bot),
+        ).as_(bot)
+        await handle_card_action(callback, Store(database))
+
+        reopened = Store(database)
+        records = await reopened.list_records()
+        versions, exceptions = await reopened.get_schedule()
+        assert len(records) == 1
+        assert records[0].revision == 3
+        assert isinstance(records[0].data, ClassData)
+        assert records[0].data.last_date == min(last_date or date.max, date(2099, 11, 18))
+        assert records[0].poster_source_id is None
+        assert exceptions == []
+        assert [
+            (item.effective_from, item.effective_until, item.poster_source_id) for item in versions
+        ] == [
+            (date(2099, 11, 10), date(2099, 11, 11), poster.id),
+            (date(2099, 11, 11), None, None),
+        ]
+        assert [
+            item.actual_date for item in expand_schedule(versions, exceptions, date(2099, 11, 16))
+        ] == [date(2099, 11, 17)]
+        assert expand_schedule(versions, exceptions, date(2099, 11, 23)) == []
+        assert expand_schedule(versions, exceptions, date(2099, 11, 30)) == []
+        restored_poster = await reopened.get_source_by_id(poster.id)
+        assert restored_poster is not None and restored_poster.attachment_status == "saved"
+        assert full_poster_path.read_bytes() == b"saved poster"
+        await bot.session.close()
+
+    asyncio.run(scenario())
+
+
+def test_repeated_detach_after_v3_migration_preserves_both_histories(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "legacy-v3.sqlite3"
+        migration_dir = Path(__file__).parents[1] / "src" / "dance_community_bot" / "migrations"
+        with closing(sqlite3.connect(database)) as connection:
+            for migration_name in (
+                "001_initial.sql",
+                "002_intake.sql",
+                "003_schedule.sql",
+            ):
+                connection.executescript(
+                    (migration_dir / migration_name).read_text(encoding="utf-8")
+                )
+            connection.execute("PRAGMA user_version = 3")
+
+        store = Store(database)
+        series_source = await store.save_source(
+            SourceInput(
+                chat_id=111,
+                message_id=1,
+                text="Исходное занятие",
+                received_at=NOW,
+                telegram_file_id="poster-file",
+                is_photo=True,
+            )
+        )
+        poster_path = Path("posters/class.jpg")
+        (database.parent / poster_path.parent).mkdir()
+        await asyncio.to_thread((database.parent / poster_path).write_bytes, b"poster")
+        await store.set_source_poster_path(series_source.id, poster_path)
+        class_draft = await store.save_draft(
+            series_source.id,
+            ClassData(
+                title="Popping",
+                first_date=date(2026, 11, 10),
+                start_time=time(19),
+                place="Зал A",
+            ),
+            poster_source_id=series_source.id,
+        )
+        series = await store.confirm_draft(class_draft.id, class_draft.version)
+        now = NOW
+        first_transfer_source = await store.save_source(
+            SourceInput(chat_id=111, message_id=2, text="Первый перенос", received_at=NOW)
+        )
+        transfer = await store.propose_schedule_change(
+            TransferOccurrence(
+                action="transfer_occurrence",
+                series_id=series.id,
+                expected_revision=1,
+                original_date=date(2026, 11, 10),
+                new_date=date(2026, 11, 18),
+                new_time=time(20, 30),
+                source_id=first_transfer_source.id,
+            ),
+            now,
+        )
+        await store.confirm_schedule_change(transfer.id, transfer.version, now)
+        first_series_change = await store.propose_schedule_change(
+            ChangeSeries(
+                action="change_series",
+                series_id=series.id,
+                expected_revision=1,
+                effective_from=date(2026, 11, 17),
+                data=ClassData(
+                    title="Popping",
+                    first_date=date(2026, 11, 17),
+                    start_time=time(20),
+                    place="Зал B",
+                ),
+            ),
+            now,
+        )
+        await store.resolve_schedule_change(
+            first_series_change.id,
+            first_series_change.version,
+            original_date=date(2026, 11, 10),
+            resolution="detach",
+        )
+        await store.confirm_schedule_change(
+            first_series_change.id, first_series_change.version + 1, now
+        )
+        first_event = next(
+            record for record in await store.list_records() if isinstance(record.data, EventData)
+        )
+        await store.cancel_record(first_event.id, first_event.revision)
+
+        exception_revision = await store.get_schedule_exception_revision(
+            series.id, date(2026, 11, 10)
+        )
+        remove = await store.propose_schedule_change(
+            RemoveException(
+                action="remove_exception",
+                series_id=series.id,
+                expected_revision=2,
+                expected_exception_revision=exception_revision,
+                original_date=date(2026, 11, 10),
+            ),
+            now,
+        )
+        await store.confirm_schedule_change(remove.id, remove.version, now)
+        exception_revision = await store.get_schedule_exception_revision(
+            series.id, date(2026, 11, 10)
+        )
+        second_transfer_source = await store.save_source(
+            SourceInput(chat_id=111, message_id=3, text="Второй перенос", received_at=NOW)
+        )
+        second_transfer = await store.propose_schedule_change(
+            TransferOccurrence(
+                action="transfer_occurrence",
+                series_id=series.id,
+                expected_revision=2,
+                expected_exception_revision=exception_revision,
+                original_date=date(2026, 11, 10),
+                new_date=date(2026, 11, 18),
+                new_time=time(21),
+                source_id=second_transfer_source.id,
+            ),
+            now,
+        )
+        await store.confirm_schedule_change(second_transfer.id, second_transfer.version, now)
+
+        migrated = Store(database)
+        await migrated.initialize()
+        await migrated.initialize()
+        with closing(sqlite3.connect(database)) as connection:
+            existing_links = connection.execute(
+                "SELECT event_record_id FROM detached_occurrence_links"
+            ).fetchall()
+        assert existing_links == [(first_event.id,)]
+
+        second_series_change = await migrated.propose_schedule_change(
+            ChangeSeries(
+                action="change_series",
+                series_id=series.id,
+                expected_revision=2,
+                effective_from=date(2026, 11, 18),
+                data=ClassData(
+                    title="Popping",
+                    first_date=date(2026, 11, 24),
+                    start_time=time(21),
+                    place="Зал C",
+                ),
+            ),
+            now,
+        )
+        detached_draft = await migrated.resolve_schedule_change(
+            second_series_change.id,
+            second_series_change.version,
+            original_date=date(2026, 11, 10),
+            resolution="detach",
+        )
+        await migrated.confirm_schedule_change(detached_draft.id, detached_draft.version, now)
+        await migrated.confirm_schedule_change(detached_draft.id, detached_draft.version, now)
+
+        records = await migrated.list_records()
+        events = [record for record in records if isinstance(record.data, EventData)]
+        assert len(events) == 2
+        assert (
+            next(record for record in events if record.id == first_event.id).status == "cancelled"
+        )
+        second_event = next(record for record in events if record.id != first_event.id)
+        assert second_event.status == "active"
+        assert (database.parent / poster_path).read_bytes() == b"poster"
+        with closing(sqlite3.connect(database)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()
+            links = connection.execute(
+                "SELECT event_record_id, series_id, original_date, source_id, "
+                "exception_source_id, poster_source_id "
+                "FROM detached_occurrence_links ORDER BY event_record_id"
+            ).fetchall()
+            foreign_key_violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+            history_count = connection.execute(
+                "SELECT COUNT(*) FROM schedule_exception_history"
+            ).fetchone()
+        assert version == (4,)
+        assert links == [
+            (
+                first_event.id,
+                series.id,
+                "2026-11-10",
+                series_source.id,
+                first_transfer_source.id,
+                series_source.id,
+            ),
+            (
+                second_event.id,
+                series.id,
+                "2026-11-10",
+                series_source.id,
+                second_transfer_source.id,
+                series_source.id,
+            ),
+        ]
+        assert foreign_key_violations == []
+        assert history_count is not None and history_count[0] >= 6
 
     asyncio.run(scenario())
 

@@ -251,7 +251,7 @@ class Store:
             schema_version = row[0]
             if not isinstance(schema_version, int):
                 raise RuntimeError("Некорректная версия схемы базы данных.")
-            if schema_version > 3:
+            if schema_version > 4:
                 raise RuntimeError("Версия схемы базы данных новее поддерживаемой.")
             if schema_version == 0:
                 for statement in migration.split(";"):
@@ -280,6 +280,17 @@ class Store:
                     if statement.strip():
                         connection.execute(statement)
                 connection.execute("PRAGMA user_version = 3")
+                schema_version = 3
+            if schema_version < 4:
+                detached_links_migration = (
+                    files("dance_community_bot")
+                    .joinpath("migrations", "004_detached_occurrence_links.sql")
+                    .read_text(encoding="utf-8")
+                )
+                for statement in detached_links_migration.split(";"):
+                    if statement.strip():
+                        connection.execute(statement)
+                connection.execute("PRAGMA user_version = 4")
 
     def _save_source_sync(self, source: SourceInput) -> Source:
         with self._transaction() as connection:

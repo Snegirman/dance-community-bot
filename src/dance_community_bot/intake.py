@@ -408,8 +408,25 @@ async def _handle_schedule_source(message: Message, source: Source, store: Store
     if binding is None or binding.schedule_action is None:
         return False
     poster = source if source.is_photo else None
-    if poster is None and binding.schedule_action == "change_series" and binding.source_id:
-        poster = await store.get_source_by_id(binding.source_id)
+    if poster is None and binding.schedule_action == "change_series":
+        source_id = binding.source_id
+        visited_source_ids = {source.id}
+        while source_id is not None and source_id not in visited_source_ids:
+            visited_source_ids.add(source_id)
+            candidate = await store.get_source_by_id(source_id)
+            if candidate is None or candidate.chat_id != source.chat_id:
+                break
+            if candidate.is_photo:
+                poster = candidate
+                break
+            if candidate.reply_to_message_id is None:
+                break
+            upstream = await store.get_card_binding(
+                candidate.chat_id, candidate.reply_to_message_id
+            )
+            if upstream is None:
+                break
+            source_id = upstream.source_id
     poster_source_id: int | None = None
     if poster is not None and poster.is_photo and poster.attachment_status != "removed":
         if not await _download_poster(message, poster, store):

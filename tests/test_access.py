@@ -10,8 +10,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import AnswerCallbackQuery, SendMessage, TelegramMethod
 from aiogram.methods.base import TelegramType
-from aiogram.types import CallbackQuery, Chat, Message, Update, User
-from pydantic import ValidationError
+from aiogram.types import CallbackQuery, Chat, InlineKeyboardMarkup, Message, Update, User
+from pydantic import SecretStr, ValidationError
 
 from dance_community_bot.access import is_owner_private
 from dance_community_bot.bot import create_dispatcher
@@ -27,7 +27,7 @@ TOKEN = "987654:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno"
 class RecordingSession(BaseSession):
     def __init__(self) -> None:
         super().__init__()
-        self.requests: list[TelegramMethod[TelegramType]] = []
+        self.requests: list[SendMessage | AnswerCallbackQuery] = []
         self.closed = False
 
     async def close(self) -> None:
@@ -39,7 +39,7 @@ class RecordingSession(BaseSession):
         method: TelegramMethod[TelegramType],
         timeout: int | None = None,
     ) -> TelegramType:
-        self.requests.append(method)
+        original_method = method
         if isinstance(method, SendMessage):
             if not isinstance(method.chat_id, int):
                 raise AssertionError("The test sends messages only to numeric chats")
@@ -53,9 +53,10 @@ class RecordingSession(BaseSession):
             result = True
         else:
             raise AssertionError(f"Unexpected Telegram method: {method.__class__.__name__}")
+        self.requests.append(method)
         response = self.check_response(
             bot=bot,
-            method=method,
+            method=original_method,
             status_code=200,
             content=self.json_dumps({"ok": True, "result": result}),
         )
@@ -84,10 +85,10 @@ def client() -> Iterator[tuple[Bot, RecordingSession]]:
 @pytest.fixture
 def app(tmp_path: Path) -> tuple[Dispatcher, Store]:
     settings = Settings(
-        telegram_bot_token=TOKEN,
+        telegram_bot_token=SecretStr(TOKEN),
         telegram_owner_id=OWNER_ID,
         telegram_webhook_url="https://dance.example.org/telegram/webhook",
-        telegram_webhook_secret="test_webhook_secret",
+        telegram_webhook_secret=SecretStr("test_webhook_secret"),
         database_path=tmp_path / "dance.sqlite3",
     )
     store = Store(settings.database_path)
@@ -382,7 +383,7 @@ def test_dispatcher_confirms_a_bound_card_action_for_the_owner(
         ).as_(bot)
         await show_draft(card, draft, store)
         sent = next(request for request in session.requests if isinstance(request, SendMessage))
-        assert sent.reply_markup is not None
+        assert isinstance(sent.reply_markup, InlineKeyboardMarkup)
         button = sent.reply_markup.inline_keyboard[0][0]
         assert button.callback_data is not None
         return button.callback_data
@@ -441,7 +442,7 @@ def test_dispatcher_stale_confirm_button_does_not_confirm_newer_draft(
         first_sent = next(
             request for request in session.requests if isinstance(request, SendMessage)
         )
-        assert first_sent.reply_markup is not None
+        assert isinstance(first_sent.reply_markup, InlineKeyboardMarkup)
         confirm_button = first_sent.reply_markup.inline_keyboard[0][0]
         assert confirm_button.callback_data is not None
         newer_source = await store.save_source(

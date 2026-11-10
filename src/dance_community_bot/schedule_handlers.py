@@ -606,6 +606,14 @@ async def handle_schedule_reply(
             if version is None:
                 raise ValueError("На эту дату у серии нет действующего расписания.")
             data = _next_rule_data(version.data, effective_from)
+            if version.effective_until is not None:
+                last_date = date.fromordinal(version.effective_until.toordinal() - 1)
+                if data.last_date is None or last_date < data.last_date:
+                    if data.first_date > last_date:
+                        raise ValueError(
+                            "На эту дату у серии уже не осталось регулярных проведений."
+                        )
+                    data = data.model_copy(update={"last_date": last_date})
             change = ChangeSeries(
                 action="change_series",
                 series_id=binding.schedule_series_id,
