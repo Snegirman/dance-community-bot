@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 
+import pytest
 from aiogram import Bot
 from aiogram.methods import SendMessage
 from aiogram.types import CallbackQuery, Chat, Message, PhotoSize, User
 from telegram_transport import RecordingSession
 
-from dance_community_bot.cards import show_draft, show_record
+from dance_community_bot.cards import format_card, show_draft, show_record
 from dance_community_bot.intake import handle_card_action, ingest_message
 from dance_community_bot.models import CardBinding, EventData, SourceInput
 from dance_community_bot.storage import Store
@@ -163,6 +164,102 @@ def test_duplicate_pending_card_warns_and_links_to_the_other_draft(tmp_path: Pat
             assert len(matching_actions) == 1
             assert matching_actions[0].draft_id == drafts[0].id
             assert matching_actions[0].record_id == drafts[0].record_id
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_duplicate_warning_ignores_stale_drafts_and_cancelled_records(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        await store.initialize()
+        session = RecordingSession(OWNER_ID)
+        bot = Bot(token=TOKEN, session=session)
+        data = EventData(
+            title="Джем",
+            event_type="Джем",
+            start_date=date(2099, 11, 14),
+            start_time=time(18, 30),
+        )
+        try:
+            cancelled_source = await store.save_source(
+                SourceInput(chat_id=OWNER_ID, message_id=1, received_at=NOW, text=TEMPLATE)
+            )
+            cancelled_draft = await store.save_draft(
+                cancelled_source.id, data, poster_source_id=None
+            )
+            cancelled_record = await store.confirm_draft(
+                cancelled_draft.id, cancelled_draft.version
+            )
+            await store.cancel_record(cancelled_record.id, cancelled_record.revision)
+
+            rejected_source = await store.save_source(
+                SourceInput(chat_id=OWNER_ID, message_id=2, received_at=NOW, text=TEMPLATE)
+            )
+            rejected_draft = await store.save_draft(rejected_source.id, data, poster_source_id=None)
+            await store.reject_draft(rejected_draft.id, rejected_draft.version)
+
+            superseded_source = await store.save_source(
+                SourceInput(chat_id=OWNER_ID, message_id=3, received_at=NOW, text=TEMPLATE)
+            )
+            superseded_draft = await store.save_draft(
+                superseded_source.id, data, poster_source_id=None
+            )
+            replacement_source = await store.save_source(
+                SourceInput(chat_id=OWNER_ID, message_id=4, received_at=NOW, text=TEMPLATE)
+            )
+            await store.save_draft(
+                replacement_source.id,
+                data.model_copy(update={"title": "Другой джем"}),
+                poster_source_id=None,
+                record_id=superseded_draft.record_id,
+            )
+
+            active_source = await store.save_source(
+                SourceInput(chat_id=OWNER_ID, message_id=5, received_at=NOW, text=TEMPLATE)
+            )
+            active_draft = await store.save_draft(active_source.id, data, poster_source_id=None)
+            active_record = await store.confirm_draft(active_draft.id, active_draft.version)
+            pending_edit_source = await store.save_source(
+                SourceInput(chat_id=OWNER_ID, message_id=6, received_at=NOW, text=TEMPLATE)
+            )
+            pending_edit = await store.save_draft(
+                pending_edit_source.id,
+                data,
+                poster_source_id=None,
+                record_id=active_record.id,
+                base_revision=active_record.revision,
+            )
+
+            incoming_source = await store.save_source(
+                SourceInput(chat_id=OWNER_ID, message_id=7, received_at=NOW, text=TEMPLATE)
+            )
+            incoming_draft = await store.save_draft(incoming_source.id, data, poster_source_id=None)
+            message = Message(
+                message_id=8,
+                date=NOW,
+                chat=Chat(id=OWNER_ID, type="private"),
+                from_user=User(id=OWNER_ID, is_bot=False, first_name="Владелец"),
+            ).as_(bot)
+
+            await show_draft(message, incoming_draft, store)
+
+            card = session.requests[-1]
+            assert isinstance(card, SendMessage)
+            assert card.text.lower().count("похоже на событие") == 1
+            assert card.reply_markup is not None
+            view_actions = []
+            for row in card.reply_markup.inline_keyboard:
+                for button in row:
+                    if button.callback_data is None:
+                        continue
+                    action = await store.get_card_action(button.callback_data.removeprefix("a:"))
+                    if action is not None and action.action == "view":
+                        view_actions.append(action)
+            assert len(view_actions) == 1
+            assert view_actions[0].draft_id == pending_edit.id
+            assert view_actions[0].record_id == pending_edit.record_id
         finally:
             await session.close()
 
@@ -358,7 +455,18 @@ def test_long_emoji_card_preserves_text_in_telegram_sized_messages(tmp_path: Pat
     asyncio.run(scenario())
 
 
-def test_cancelled_record_card_reports_current_status_without_edit_buttons(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "description",
+    [
+        "я" * 4095 + "💃" * 2000 + "<все условия сохранены>",
+        "я" * 4086 + "\n" + "💃" * 3000,
+        "я" * 4086 + "\n\n" + "💃" * 3000,
+    ],
+    ids=["mixed_text", "newline_at_boundary", "blank_line_at_boundary"],
+)
+def test_mixed_russian_and_emoji_card_splits_at_utf16_boundary(
+    tmp_path: Path, description: str
+) -> None:
     async def scenario() -> None:
         store = Store(tmp_path / "dance.sqlite3")
         await store.initialize()
@@ -367,8 +475,58 @@ def test_cancelled_record_card_reports_current_status_without_edit_buttons(tmp_p
         )
         draft = await store.save_draft(
             source.id,
-            EventData(title="Джем", event_type="Джем", start_date=date(2026, 11, 14)),
+            EventData(
+                title="Джем",
+                event_type="Джем",
+                start_date=date(2099, 11, 14),
+                description=description,
+            ),
             poster_source_id=None,
+        )
+        session = RecordingSession(OWNER_ID)
+        bot = Bot(token=TOKEN, session=session)
+        try:
+            await show_draft(photo_message(bot), draft, store)
+            expected = (
+                f"Черновик №{draft.record_id} · версия {draft.version}\n\n"
+                f"{format_card(draft.data)}\n\n"
+                "Афиша: не добавлена"
+            )
+            assert "".join(session.messages) == expected
+            assert all(len(text.encode("utf-16-le")) // 2 <= 4096 for text in session.messages)
+            assert all(text.strip() for text in session.messages)
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("has_poster", [False, True])
+def test_cancelled_record_card_reports_current_status_without_edit_buttons(
+    tmp_path: Path, has_poster: bool
+) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        await store.initialize()
+        source = await store.save_source(
+            SourceInput(
+                chat_id=OWNER_ID,
+                message_id=1,
+                received_at=NOW,
+                text=TEMPLATE,
+                telegram_file_id="poster" if has_poster else None,
+                is_photo=has_poster,
+            )
+        )
+        if has_poster:
+            poster_path = Path("posters/cancelled.jpg")
+            poster_file = store.path.parent / poster_path
+            poster_file.write_bytes(b"poster")
+            await store.set_source_poster_path(source.id, poster_path)
+        draft = await store.save_draft(
+            source.id,
+            EventData(title="Джем", event_type="Джем", start_date=date(2026, 11, 14)),
+            poster_source_id=source.id if has_poster else None,
         )
         record = await store.confirm_draft(draft.id, draft.version)
         cancelled = await store.cancel_record(record.id, record.revision)

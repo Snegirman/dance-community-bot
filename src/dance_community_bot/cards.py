@@ -20,7 +20,7 @@ from .models import (
 from .storage import Store
 
 _MOSCOW = ZoneInfo("Europe/Moscow")
-_MESSAGE_LIMIT = 3500
+_MESSAGE_LIMIT = 4096
 _EVENTS_PAGE_SIZE = 5
 
 
@@ -78,9 +78,7 @@ def format_card(data: CardData) -> str:
 
 def _card_warnings(
     data: CardData,
-    records: list[Record],
-    *,
-    excluded_record_id: int | None = None,
+    matches: list[Record | Draft],
 ) -> list[str]:
     now = datetime.now(_MOSCOW)
     start_date = data.start_date if isinstance(data, EventData) else data.first_date
@@ -94,49 +92,69 @@ def _card_warnings(
     else:
         warnings = []
 
-    for record in _matching_records(data, records, excluded_record_id=excluded_record_id):
-        warnings.append(f"Предупреждение: похоже на событие в карточке №{record.id}.")
+    for item in matches:
+        record_id = item.id if isinstance(item, Record) else item.record_id
+        warnings.append(f"Предупреждение: похоже на событие в карточке №{record_id}.")
     return warnings
 
 
-def _matching_records(
+def _matching_entries(
     data: CardData,
     records: list[Record],
+    drafts: list[Draft],
     *,
     excluded_record_id: int | None,
-) -> list[Record]:
+) -> list[Record | Draft]:
     start_date = data.start_date if isinstance(data, EventData) else data.first_date
     title = data.title.casefold()
-    matching: list[Record] = []
-    for record in records:
-        if (
-            record.status != "active"
-            or record.id == excluded_record_id
-            or record.data.title.casefold() != title
-        ):
-            continue
-        other_start_date = (
-            record.data.start_date if isinstance(record.data, EventData) else record.data.first_date
+
+    def data_matches(candidate: CardData) -> bool:
+        candidate_start_date = (
+            candidate.start_date if isinstance(candidate, EventData) else candidate.first_date
         )
-        if other_start_date == start_date and record.data.start_time == data.start_time:
-            matching.append(record)
-    return matching
+        return (
+            candidate.title.casefold() == title
+            and candidate_start_date == start_date
+            and candidate.start_time == data.start_time
+        )
+
+    matching: dict[int, Record | Draft] = {}
+    for record in records:
+        if record.status != "active" or record.id == excluded_record_id:
+            continue
+        if data_matches(record.data):
+            matching[record.id] = record
+    for draft in drafts:
+        if draft.status != "pending" or draft.record_id == excluded_record_id:
+            continue
+        if data_matches(draft.data):
+            matching[draft.record_id] = draft
+    return list(matching.values())
 
 
 def _chunks(text: str) -> list[str]:
     chunks: list[str] = []
-    remainder = text
-    while len(remainder) > _MESSAGE_LIMIT:
-        boundary = remainder.rfind("\n", 0, _MESSAGE_LIMIT)
-        if boundary <= 0:
-            boundary = _MESSAGE_LIMIT
-            chunks.append(remainder[:boundary])
-            remainder = remainder[boundary:]
-        else:
-            chunks.append(remainder[: boundary + 1])
-            remainder = remainder[boundary + 1 :]
-    if remainder:
-        chunks.append(remainder)
+    start = 0
+    while start < len(text):
+        end = start
+        units = 0
+        has_content = False
+        line_boundary: int | None = None
+        while end < len(text):
+            units_for_character = 2 if ord(text[end]) > 0xFFFF else 1
+            if units + units_for_character > _MESSAGE_LIMIT:
+                break
+            units += units_for_character
+            has_content = has_content or not text[end].isspace()
+            end += 1
+            if text[end - 1] == "\n" and has_content:
+                line_boundary = end
+        if end == len(text):
+            chunks.append(text[start:end])
+            break
+        boundary = line_boundary if line_boundary is not None else end
+        chunks.append(text[start:boundary])
+        start = boundary
     return chunks
 
 
@@ -267,17 +285,17 @@ async def show_draft(message: Message, draft: Draft, store: Store) -> None:
             lines.append("Афиша: добавлена")
 
     records = await store.list_records()
-    lines.extend(_card_warnings(draft.data, records, excluded_record_id=draft.record_id))
-    duplicate_buttons = [
-        await _action_button(
-            store,
-            f"Открыть №{record.id}",
-            "view",
-            record_id=record.id,
-            revision=record.revision,
-        )
-        for record in _matching_records(draft.data, records, excluded_record_id=draft.record_id)
-    ]
+    drafts = await store.list_drafts()
+    matches = _matching_entries(
+        draft.data,
+        records,
+        drafts,
+        excluded_record_id=draft.record_id,
+    )
+    lines.extend(_card_warnings(draft.data, matches))
+    duplicate_buttons: list[InlineKeyboardButton] = []
+    for item in matches:
+        duplicate_buttons.extend(await _event_entry_buttons(item, store))
     if duplicate_buttons:
         rows.append(duplicate_buttons)
     text = "\n\n".join(lines)
@@ -295,35 +313,41 @@ async def show_draft(message: Message, draft: Draft, store: Store) -> None:
 
 
 async def show_record(message: Message, record: Record, store: Store) -> None:
-    row = [
-        await _action_button(
-            store,
-            "Исправить",
-            "edit",
-            record_id=record.id,
-            revision=record.revision,
-        ),
-        await _action_button(
-            store,
-            "Отменить",
-            "cancel",
-            record_id=record.id,
-            revision=record.revision,
-        ),
-    ]
-    if record.poster_source_id is not None:
+    rows: list[list[InlineKeyboardButton]] = []
+    if record.status == "active":
+        row = [
+            await _action_button(
+                store,
+                "Исправить",
+                "edit",
+                record_id=record.id,
+                revision=record.revision,
+            )
+        ]
         row.append(
             await _action_button(
                 store,
-                "Убрать афишу",
-                "remove_poster",
+                "Отменить",
+                "cancel",
                 record_id=record.id,
                 revision=record.revision,
-                source_id=record.poster_source_id,
             )
         )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[row])
+        if record.poster_source_id is not None:
+            row.append(
+                await _action_button(
+                    store,
+                    "Убрать афишу",
+                    "remove_poster",
+                    record_id=record.id,
+                    revision=record.revision,
+                    source_id=record.poster_source_id,
+                )
+            )
+        rows.append(row)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
     poster = "Афиша: добавлена" if record.poster_source_id is not None else "Афиша: не добавлена"
+    status = "Статус: Отменена\n" if record.status == "cancelled" else ""
     binding = CardBinding(
         chat_id=message.chat.id,
         bot_message_id=0,
@@ -332,7 +356,8 @@ async def show_record(message: Message, record: Record, store: Store) -> None:
     )
     await _send_bound_text(
         message,
-        f"Запись №{record.id} · ревизия {record.revision}\n{format_card(record.data)}\n{poster}",
+        f"Запись №{record.id} · ревизия {record.revision}\n{status}"
+        f"{format_card(record.data)}\n{poster}",
         store,
         binding,
         keyboard,

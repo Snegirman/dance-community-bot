@@ -146,6 +146,52 @@ def test_duplicate_warning_links_existing_card_and_skips_record_being_edited(
             action is not None and action.action == "view" and action.draft_id == duplicate.id
             for action in edit_actions
         )
+
+        await store.reject_draft(duplicate.id, duplicate.version)
+        changed_edit_source = await store.save_source(
+            SourceInput(
+                chat_id=CHAT_ID,
+                message_id=6,
+                text="changed edit",
+                received_at=datetime(2026, 11, 7, 12, 3, tzinfo=UTC),
+            )
+        )
+        await store.save_draft(
+            changed_edit_source.id,
+            duplicate_data.model_copy(update={"title": "Changed title"}),
+            poster_source_id=None,
+            record_id=existing.id,
+            base_revision=existing.revision,
+        )
+        incoming_source = await store.save_source(
+            SourceInput(
+                chat_id=CHAT_ID,
+                message_id=7,
+                text="incoming duplicate",
+                received_at=datetime(2026, 11, 7, 12, 4, tzinfo=UTC),
+            )
+        )
+        incoming = await store.save_draft(incoming_source.id, duplicate_data, poster_source_id=None)
+        await show_draft(message.model_copy(update={"message_id": 8}), incoming, store)
+
+        third_card = session.requests[2]
+        assert isinstance(third_card, SendMessage)
+        assert f"похоже на событие в карточке №{existing.id}." in third_card.text.lower()
+        assert (
+            f"похоже на событие в карточке №{duplicate.record_id}." not in third_card.text.lower()
+        )
+        assert third_card.reply_markup is not None
+        active_links = []
+        for row in third_card.reply_markup.inline_keyboard:
+            for button in row:
+                if button.callback_data is None:
+                    continue
+                action = await store.get_card_action(button.callback_data.removeprefix("a:"))
+                if action is not None and action.action == "view":
+                    active_links.append(action)
+        assert len(active_links) == 1
+        assert active_links[0].record_id == existing.id
+        assert active_links[0].draft_id is None
         await bot.session.close()
 
     asyncio.run(scenario())
