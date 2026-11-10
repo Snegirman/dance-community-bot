@@ -1,20 +1,39 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.methods import SendMessage
 from aiogram.types import Chat, Message, User
 from telegram_transport import RecordingSession
 
-from dance_community_bot.cards import format_card, show_draft, show_events, show_record, show_source
+from dance_community_bot.cards import (
+    _card_warnings,
+    format_card,
+    show_draft,
+    show_events,
+    show_record,
+    show_source,
+)
 from dance_community_bot.models import EventData, SourceInput
 from dance_community_bot.storage import Store
 
 TOKEN = "987654:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno"
 CHAT_ID = 222
+
+
+def test_card_past_date_warning_uses_template_warning() -> None:
+    today = datetime.now(ZoneInfo("Europe/Moscow")).date()
+    data = EventData(
+        title="Jam",
+        event_type="Джем",
+        start_date=today - timedelta(days=2),
+    )
+
+    assert _card_warnings(data, []) == ["Предупреждение: Поле «Дата» события уже прошло."]
 
 
 def test_card_keeps_multiline_optional_fields_without_truncating() -> None:

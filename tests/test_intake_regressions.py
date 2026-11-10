@@ -11,7 +11,7 @@ from aiogram.methods import SendMessage
 from aiogram.types import CallbackQuery, Chat, Message, PhotoSize, User
 from telegram_transport import RecordingSession
 
-from dance_community_bot.cards import format_card, show_draft, show_record
+from dance_community_bot.cards import _chunks, format_card, show_draft, show_record
 from dance_community_bot.intake import handle_card_action, ingest_message
 from dance_community_bot.models import CardBinding, EventData, SourceInput
 from dance_community_bot.storage import Store
@@ -124,6 +124,62 @@ def test_callback_token_from_another_message_cannot_confirm(tmp_path: Path) -> N
             await handle_card_action(callback_for(bot, action.token, 9999), store)
             assert await store.list_records() == []
             assert (await store.get_draft(draft.id)) == draft
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_long_incoming_draft_binds_confirmation_to_last_delivered_chunk(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        session = RecordingSession(OWNER_ID)
+        bot = Bot(token=TOKEN, session=session)
+        store = Store(tmp_path / "dance.sqlite3")
+        await store.initialize()
+        description = "x" * 3950
+        text = f"Название: Джем\nДата: 14.11.2026\nТип: Джем\nОписание: {description}"
+        assert len(text) < 4096
+
+        async def fail_after_first_chunk() -> bool:
+            return len(session.messages) == 0
+
+        session.before_send_check = fail_after_first_chunk
+        incoming = Message(
+            message_id=1,
+            date=NOW,
+            chat=Chat(id=OWNER_ID, type="private"),
+            from_user=User(id=OWNER_ID, is_bot=False, first_name="Владелец"),
+            text=text,
+        ).as_(bot)
+        try:
+            with pytest.raises(AssertionError, match="Проверка перед отправкой"):
+                await ingest_message(incoming, store)
+
+            drafts = await store.list_drafts()
+            assert len(drafts) == 1
+            preview = (
+                f"Черновик №{drafts[0].record_id} · версия {drafts[0].version}\n\n"
+                f"{format_card(drafts[0].data)}\n\nАфиша: не добавлена"
+            )
+            assert len(_chunks(preview)) == 2
+            assert session.requests[0].reply_markup is None
+
+            session.before_send_check = None
+            request_start = len(session.requests)
+            await show_draft(incoming, drafts[0], store)
+            delivered = session.requests[request_start:]
+            assert len(delivered) == 2
+            assert delivered[0].reply_markup is None
+            assert delivered[1].reply_markup is not None
+            confirm = delivered[1].reply_markup.inline_keyboard[0][0]
+            assert confirm.text == "Сохранить"
+            assert confirm.callback_data is not None
+            action = await store.get_card_action(confirm.callback_data.removeprefix("a:"))
+            assert action is not None and action.bot_message_id == 100 + len(session.messages)
+
+            await handle_card_action(callback_for(bot, action.token, action.bot_message_id), store)
+            record = await store.get_record(drafts[0].record_id)
+            assert record is not None and record.status == "active"
         finally:
             await session.close()
 

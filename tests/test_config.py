@@ -104,6 +104,7 @@ def test_load_settings_reads_dotenv_and_environment_overrides_it(
         ("TELEGRAM_WEBHOOK_URL", "https://dance.example.org/webhook?mode=1"),
         ("TELEGRAM_WEBHOOK_URL", "https://dance.example.org/webhook#fragment"),
         ("TELEGRAM_WEBHOOK_URL", "https://dance.example.org/telegram/{oops"),
+        ("TELEGRAM_WEBHOOK_URL", "https://dance.example.org/telegram/%7Bwebhook%7D"),
         ("TELEGRAM_WEBHOOK_URL", "https://dance.example.org/hook\n"),
         ("TELEGRAM_WEBHOOK_URL", "https://dance.example.org/hook with space"),
         ("TELEGRAM_WEBHOOK_URL", "https://dance.example.org"),

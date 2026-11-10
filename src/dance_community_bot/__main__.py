@@ -1,12 +1,14 @@
 """Запуск Telegram-бота через входящие webhook-запросы."""
 
+import asyncio
+import secrets
 import sys
 from collections.abc import AsyncIterator
-from urllib.parse import urlsplit
 
 from aiogram import Bot, Dispatcher
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+from aiogram.methods import TelegramMethod
 from aiohttp import web
+from yarl import URL
 
 from dance_community_bot.bot import create_dispatcher
 from dance_community_bot.config import Settings, SettingsError, load_settings
@@ -18,14 +20,27 @@ WEBHOOK_HOST = "127.0.0.1"
 def create_webhook_app(settings: Settings, bot: Bot, dispatcher: Dispatcher) -> web.Application:
     """Создать aiohttp-приложение для одного Telegram webhook."""
     app = web.Application()
-    request_handler = SimpleRequestHandler(
-        dispatcher=dispatcher,
-        bot=bot,
-        handle_in_background=False,
-        secret_token=settings.telegram_webhook_secret.get_secret_value(),
-    )
-    path = urlsplit(settings.telegram_webhook_url).path
-    app.router.add_post(path, request_handler.handle)
+    secret = settings.telegram_webhook_secret.get_secret_value()
+    path = URL(settings.telegram_webhook_url).path_safe
+
+    async def handle_webhook(request: web.Request) -> web.Response:
+        if not secrets.compare_digest(
+            request.headers.get("X-Telegram-Bot-Api-Secret-Token", ""), secret
+        ):
+            return web.Response(body="Unauthorized", status=401)
+
+        try:
+            async with asyncio.timeout(50):
+                update = await request.json(loads=bot.session.json_loads)
+                result = await dispatcher.feed_raw_update(bot=bot, update=update)
+                if isinstance(result, TelegramMethod):
+                    await bot(result)
+        except TimeoutError:
+            return web.Response(status=503)
+
+        return web.json_response({})
+
+    app.router.add_post(path, handle_webhook)
 
     async def manage_bot_lifecycle(_: web.Application) -> AsyncIterator[None]:
         try:

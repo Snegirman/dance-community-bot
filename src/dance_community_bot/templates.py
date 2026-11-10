@@ -91,20 +91,29 @@ def _add_missing_errors(
             errors.append(f"Обязательное поле «{label}» должно содержать значение.")
 
 
+def parse_strict_date(value: str, *, format_error: str, invalid_error: str) -> date:
+    if _DATE_PATTERN.fullmatch(value) is None:
+        raise ValueError(format_error)
+    try:
+        return date(int(value[6:10]), int(value[3:5]), int(value[0:2]))
+    except ValueError as error:
+        raise ValueError(invalid_error) from error
+
+
 def _parse_date(value: str, label: str, errors: list[str], *, required: bool) -> date | None:
     if not value:
         if required:
             errors.append(f"Поле «{label}»: укажите дату в формате ДД.ММ.ГГГГ.")
         return None
 
-    if _DATE_PATTERN.fullmatch(value) is None:
-        errors.append(f"Поле «{label}»: укажите дату в формате ДД.ММ.ГГГГ.")
-        return None
-
     try:
-        return date(int(value[6:10]), int(value[3:5]), int(value[0:2]))
-    except ValueError:
-        errors.append(f"Поле «{label}»: укажите существующую дату в формате ДД.ММ.ГГГГ.")
+        return parse_strict_date(
+            value,
+            format_error=f"Поле «{label}»: укажите дату в формате ДД.ММ.ГГГГ.",
+            invalid_error=f"Поле «{label}»: укажите существующую дату в формате ДД.ММ.ГГГГ.",
+        )
+    except ValueError as error:
+        errors.append(str(error))
         return None
 
 

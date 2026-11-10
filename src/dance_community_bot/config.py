@@ -2,7 +2,7 @@
 
 import re
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from pydantic import SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -52,7 +52,7 @@ class Settings(BaseSettings):
             or not hostname
             or port == 0
             or any(character.isspace() for character in url)
-            or any(character in "{}" for character in parts.path)
+            or any(character in "{}" for character in unquote(parts.path))
             or parts.username is not None
             or parts.password is not None
             or parts.query

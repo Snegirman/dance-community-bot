@@ -18,6 +18,7 @@ from .models import (
     Source,
 )
 from .storage import Store
+from .templates import past_date_warning
 
 _MOSCOW = ZoneInfo("Europe/Moscow")
 _MESSAGE_LIMIT = 4096
@@ -80,17 +81,8 @@ def _card_warnings(
     data: CardData,
     matches: list[Record | Draft],
 ) -> list[str]:
-    now = datetime.now(_MOSCOW)
-    start_date = data.start_date if isinstance(data, EventData) else data.first_date
-    start_time = data.start_time
-    if start_date < now.date() or (
-        start_date == now.date()
-        and start_time is not None
-        and start_time < now.time().replace(tzinfo=None)
-    ):
-        warnings = ["Предупреждение: дата или время начала уже прошли."]
-    else:
-        warnings = []
+    past_warning = past_date_warning(data, datetime.now(_MOSCOW))
+    warnings = [f"Предупреждение: {past_warning}"] if past_warning is not None else []
 
     for item in matches:
         record_id = item.id if isinstance(item, Record) else item.record_id
@@ -162,16 +154,23 @@ async def _send_bound_text(
     message: Message,
     text: str,
     store: Store,
-    binding: CardBinding,
+    binding: CardBinding | None = None,
     keyboard: InlineKeyboardMarkup | None = None,
 ) -> list[Message]:
     sent_messages: list[Message] = []
-    for index, chunk in enumerate(_chunks(text)):
-        sent = await message.answer(chunk, reply_markup=keyboard if index == 0 else None)
-        await store.bind_card_message(
-            binding.model_copy(update={"chat_id": sent.chat.id, "bot_message_id": sent.message_id})
+    chunks = _chunks(text)
+    for index, chunk in enumerate(chunks):
+        sent = await message.answer(
+            chunk,
+            reply_markup=keyboard if index == len(chunks) - 1 else None,
         )
-        if index == 0 and keyboard is not None:
+        if binding is not None:
+            await store.bind_card_message(
+                binding.model_copy(
+                    update={"chat_id": sent.chat.id, "bot_message_id": sent.message_id}
+                )
+            )
+        if index == len(chunks) - 1 and keyboard is not None:
             tokens = [
                 button.callback_data.removeprefix("a:")
                 for row in keyboard.inline_keyboard

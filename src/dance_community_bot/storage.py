@@ -117,6 +117,9 @@ class Store:
     async def list_drafts(self) -> list[Draft]:
         return await asyncio.to_thread(self._list_drafts_sync)
 
+    async def list_pending_schedule_changes(self) -> list[ChangeDraft]:
+        return await asyncio.to_thread(self._list_pending_schedule_changes_sync)
+
     async def get_schedule(self) -> tuple[list[SeriesVersion], list[ScheduleException]]:
         return await asyncio.to_thread(self._get_schedule_sync)
 
@@ -688,6 +691,13 @@ class Store:
             rows = connection.execute("SELECT * FROM drafts ORDER BY id").fetchall()
             return [self._draft_from_row(row) for row in rows]
 
+    def _list_pending_schedule_changes_sync(self) -> list[ChangeDraft]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM schedule_change_drafts WHERE status = 'pending' ORDER BY id"
+            ).fetchall()
+            return [self._schedule_draft_from_row(row) for row in rows]
+
     def _get_schedule_sync(self) -> tuple[list[SeriesVersion], list[ScheduleException]]:
         with self._connection() as connection:
             connection.execute("BEGIN")
@@ -885,7 +895,7 @@ class Store:
             ).fetchone()
             if row is None:
                 raise ValueError("Неизвестное изменение расписания.")
-            if row["version"] != version or row["status"] != "pending":
+            if row["status"] != "pending":
                 raise ValueError("Подтверждение изменения устарело.")
             change = _SCHEDULE_CHANGE_ADAPTER.validate_json(row["change_json"])
             if not isinstance(change, (ChangeSeries, EndSeries)):
@@ -899,6 +909,12 @@ class Store:
             if resolution == "detach" and exception.cancelled:
                 raise ValueError("Отменённое проведение нельзя отделить от серии.")
             resolutions = dict(change.resolutions)
+            if version <= 0 or row["version"] < version:
+                raise ValueError("Подтверждение изменения устарело.")
+            if resolutions.get(original_date) == resolution:
+                return self._schedule_draft_from_row(row)
+            if row["version"] != version:
+                raise ValueError("Подтверждение изменения устарело.")
             resolutions[original_date] = resolution
             updated_change = change.model_copy(update={"resolutions": resolutions})
             next_version = version + 1
@@ -1119,6 +1135,21 @@ class Store:
         return None
 
     @classmethod
+    def _version_at_boundary(
+        cls, connection: sqlite3.Connection, series_id: int, boundary: date
+    ) -> SeriesVersion | None:
+        rows = connection.execute(
+            "SELECT * FROM schedule_versions WHERE series_id = ? AND status = 'active' "
+            "ORDER BY effective_from, revision",
+            (series_id,),
+        ).fetchall()
+        versions = [cls._series_version_from_row(row) for row in rows]
+        for version in reversed(versions):
+            if version.effective_from <= boundary:
+                return version
+        return versions[0] if versions else None
+
+    @classmethod
     def _affected_exceptions(
         cls, connection: sqlite3.Connection, change: ChangeSeries | EndSeries
     ) -> list[ScheduleException]:
@@ -1309,6 +1340,9 @@ class Store:
     ) -> None:
         new_revision = record["revision"] + 1
         boundary = change.effective_from.isoformat()
+        version_at_boundary = self._version_at_boundary(
+            connection, change.series_id, change.effective_from
+        )
         versions = connection.execute(
             "SELECT * FROM schedule_versions WHERE series_id = ? AND status = 'active'",
             (change.series_id,),
@@ -1328,9 +1362,14 @@ class Store:
                     "WHERE series_id = ? AND revision = ? AND status = 'active'",
                     (boundary, change.series_id, row["revision"]),
                 )
-        poster_source_id = (
-            None if change.remove_poster else change.poster_source_id or record["poster_source_id"]
-        )
+        if change.remove_poster:
+            poster_source_id = None
+        elif change.poster_source_id is not None:
+            poster_source_id = change.poster_source_id
+        elif version_at_boundary is not None:
+            poster_source_id = version_at_boundary.poster_source_id
+        else:
+            poster_source_id = record["poster_source_id"]
         connection.execute(
             "INSERT INTO schedule_versions "
             "(series_id, revision, effective_from, effective_until, data_json, "
@@ -1388,11 +1427,29 @@ class Store:
                         row["revision"],
                     ),
                 )
-        updated = connection.execute(
-            "UPDATE records SET revision = revision + 1 "
-            "WHERE id = ? AND revision = ? AND status = 'active'",
-            (change.series_id, record["revision"]),
-        )
+        version_row = connection.execute(
+            "SELECT * FROM schedule_versions WHERE series_id = ? AND status = 'active' "
+            "ORDER BY effective_from DESC, revision DESC LIMIT 1",
+            (change.series_id,),
+        ).fetchone()
+        if version_row is None:
+            updated = connection.execute(
+                "UPDATE records SET revision = revision + 1 "
+                "WHERE id = ? AND revision = ? AND status = 'active'",
+                (change.series_id, record["revision"]),
+            )
+        else:
+            latest_version = self._series_version_from_row(version_row)
+            updated = connection.execute(
+                "UPDATE records SET revision = revision + 1, data_json = ?, poster_source_id = ? "
+                "WHERE id = ? AND revision = ? AND status = 'active'",
+                (
+                    latest_version.data.model_dump_json(),
+                    latest_version.poster_source_id,
+                    change.series_id,
+                    record["revision"],
+                ),
+            )
         if updated.rowcount != 1:
             raise ValueError("Серия изменилась до завершения расписания.")
 

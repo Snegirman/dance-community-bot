@@ -44,6 +44,25 @@ async def saved_series(store: Store) -> int:
     return record.id
 
 
+async def saved_poster_source(store: Store, database: Path, message_id: int, filename: str) -> int:
+    source = await store.save_source(
+        SourceInput(
+            chat_id=111,
+            message_id=message_id,
+            text=filename,
+            received_at=NOW,
+            telegram_file_id=filename,
+            is_photo=True,
+        )
+    )
+    poster_path = Path("posters") / filename
+    full_path = database.parent / poster_path
+    await asyncio.to_thread(full_path.parent.mkdir, parents=True, exist_ok=True)
+    await asyncio.to_thread(full_path.write_bytes, b"poster")
+    await store.set_source_poster_path(source.id, poster_path)
+    return source.id
+
+
 def test_maximum_last_date_does_not_break_an_ordinary_week() -> None:
     version = SeriesVersion(
         series_id=1,
@@ -779,5 +798,275 @@ def test_end_preview_keeps_version_starting_on_the_inclusive_last_date(tmp_path:
         assert [(item.actual_date, item.start_time) for item in week] == [
             (date(2026, 11, 17), time(20))
         ]
+
+    asyncio.run(scenario())
+
+
+def test_series_change_inherits_poster_from_timeline_on_non_occurrence_day(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "dance.sqlite3"
+        store = Store(database)
+        await store.initialize()
+        first_poster_id = await saved_poster_source(store, database, 1, "first.jpg")
+        initial_data = ClassData(title="Popping", first_date=date(2026, 11, 1), start_time=time(19))
+        initial = await store.save_draft(
+            first_poster_id, initial_data, poster_source_id=first_poster_id
+        )
+        series = await store.confirm_draft(initial.id, initial.version)
+
+        future_poster_id = await saved_poster_source(store, database, 2, "future.jpg")
+        future = await store.propose_schedule_change(
+            ChangeSeries(
+                action="change_series",
+                series_id=series.id,
+                expected_revision=1,
+                effective_from=date(2026, 12, 1),
+                data=ClassData(title="Waving", first_date=date(2026, 12, 1), start_time=time(20)),
+                poster_source_id=future_poster_id,
+            ),
+            NOW,
+        )
+        await store.confirm_schedule_change(future.id, future.version, NOW)
+
+        changed = await store.propose_schedule_change(
+            ChangeSeries(
+                action="change_series",
+                series_id=series.id,
+                expected_revision=2,
+                effective_from=date(2026, 11, 10),
+                data=ClassData(
+                    title="Animation", first_date=date(2026, 11, 10), start_time=time(21)
+                ),
+            ),
+            NOW,
+        )
+        await store.confirm_schedule_change(changed.id, changed.version, NOW)
+
+        versions, _ = await Store(database).get_schedule()
+        actual = next(version for version in versions if version.revision == 3)
+        assert actual.poster_source_id == first_poster_id
+        assert actual.source_id is None
+        assert actual.effective_from == date(2026, 11, 10)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("initial_last_date", "expected_effective_until"),
+    [(None, date(2026, 12, 1)), (date(2026, 11, 29), date(2026, 11, 30))],
+)
+def test_end_series_syncs_record_and_supersedes_future_version(
+    tmp_path: Path,
+    initial_last_date: date | None,
+    expected_effective_until: date,
+) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "dance.sqlite3"
+        store = Store(database)
+        await store.initialize()
+        first_poster_id = await saved_poster_source(store, database, 1, "first.jpg")
+        initial_data = ClassData(
+            title="Popping",
+            first_date=date(2026, 11, 1),
+            last_date=initial_last_date,
+            start_time=time(19),
+        )
+        initial = await store.save_draft(
+            first_poster_id, initial_data, poster_source_id=first_poster_id
+        )
+        series = await store.confirm_draft(initial.id, initial.version)
+
+        future_poster_id = await saved_poster_source(store, database, 2, "future.jpg")
+        future = await store.propose_schedule_change(
+            ChangeSeries(
+                action="change_series",
+                series_id=series.id,
+                expected_revision=1,
+                effective_from=date(2026, 12, 1),
+                data=ClassData(title="Waving", first_date=date(2026, 12, 1), start_time=time(20)),
+                poster_source_id=future_poster_id,
+            ),
+            NOW,
+        )
+        await store.confirm_schedule_change(future.id, future.version, NOW)
+        end = await store.propose_schedule_change(
+            EndSeries(
+                action="end_series",
+                series_id=series.id,
+                expected_revision=2,
+                last_date=date(2026, 11, 30),
+            ),
+            NOW,
+        )
+        await store.confirm_schedule_change(end.id, end.version, NOW)
+
+        reopened = Store(database)
+        record = await reopened.get_record(series.id)
+        assert record is not None
+        assert record.data == initial_data
+        assert record.poster_source_id == first_poster_id
+        versions, exceptions = await reopened.get_schedule()
+        assert [(item.effective_from, item.effective_until) for item in versions] == [
+            (date(2026, 11, 1), expected_effective_until)
+        ]
+        assert expand_schedule(versions, exceptions, date(2026, 11, 30)) == []
+        with closing(sqlite3.connect(database)) as connection:
+            history = connection.execute(
+                "SELECT revision, source_id, poster_source_id, status FROM schedule_versions "
+                "WHERE series_id = ? ORDER BY revision",
+                (series.id,),
+            ).fetchall()
+        assert history == [
+            (1, first_poster_id, first_poster_id, "active"),
+            (2, None, future_poster_id, "superseded"),
+        ]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("after_explicit_end", [False, True], ids=["gap", "after-end"])
+def test_series_change_keeps_poster_outside_occurrence_interval(
+    tmp_path: Path, after_explicit_end: bool
+) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "dance.sqlite3"
+        store = Store(database)
+        await store.initialize()
+        poster_id = await saved_poster_source(store, database, 1, "first.jpg")
+        initial = await store.save_draft(
+            poster_id,
+            ClassData(title="Popping", first_date=date(2026, 11, 1), start_time=time(19)),
+            poster_source_id=poster_id,
+        )
+        series = await store.confirm_draft(initial.id, initial.version)
+
+        if after_explicit_end:
+            end = await store.propose_schedule_change(
+                EndSeries(
+                    action="end_series",
+                    series_id=series.id,
+                    expected_revision=1,
+                    last_date=date(2026, 11, 30),
+                ),
+                NOW,
+            )
+            await store.confirm_schedule_change(end.id, end.version, NOW)
+            effective_from = date(2026, 12, 1)
+            first_date = effective_from
+            expected_revision = 2
+        else:
+            first_gap_version = await store.propose_schedule_change(
+                ChangeSeries(
+                    action="change_series",
+                    series_id=series.id,
+                    expected_revision=1,
+                    effective_from=date(2026, 11, 10),
+                    data=ClassData(
+                        title="Waving", first_date=date(2026, 11, 17), start_time=time(20)
+                    ),
+                    poster_source_id=poster_id,
+                ),
+                NOW,
+            )
+            await store.confirm_schedule_change(
+                first_gap_version.id, first_gap_version.version, NOW
+            )
+            effective_from = date(2026, 11, 11)
+            first_date = date(2026, 11, 17)
+            expected_revision = 2
+
+        changed = await store.propose_schedule_change(
+            ChangeSeries(
+                action="change_series",
+                series_id=series.id,
+                expected_revision=expected_revision,
+                effective_from=effective_from,
+                data=ClassData(title="Animation", first_date=first_date, start_time=time(21)),
+            ),
+            NOW,
+        )
+        await store.confirm_schedule_change(changed.id, changed.version, NOW)
+
+        versions, _ = await Store(database).get_schedule()
+        actual = next(version for version in versions if version.revision == 3)
+        assert actual.poster_source_id == poster_id
+
+    asyncio.run(scenario())
+
+
+def test_schedule_resolution_replay_is_idempotent_and_pending_can_be_reopened(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        series_id = await saved_series(store)
+        transfer = await store.propose_schedule_change(
+            TransferOccurrence(
+                action="transfer_occurrence",
+                series_id=series_id,
+                expected_revision=1,
+                original_date=date(2026, 11, 10),
+                new_date=date(2026, 11, 18),
+                new_time=time(20),
+            ),
+            NOW,
+        )
+        await store.confirm_schedule_change(transfer.id, transfer.version, NOW)
+        pending = await store.propose_schedule_change(
+            ChangeSeries(
+                action="change_series",
+                series_id=series_id,
+                expected_revision=1,
+                effective_from=date(2026, 11, 17),
+                data=ClassData(title="Waving", first_date=date(2026, 11, 17), start_time=time(21)),
+            ),
+            NOW,
+        )
+        resolved = await store.resolve_schedule_change(
+            pending.id,
+            pending.version,
+            original_date=date(2026, 11, 10),
+            resolution="remove",
+        )
+
+        reopened = Store(store.path)
+        replay = await reopened.resolve_schedule_change(
+            pending.id,
+            pending.version,
+            original_date=date(2026, 11, 10),
+            resolution="remove",
+        )
+        assert replay == resolved
+        assert replay.version == pending.version + 1
+        assert await reopened.list_pending_schedule_changes() == [resolved]
+
+        with pytest.raises(ValueError, match="устарело"):
+            await reopened.resolve_schedule_change(
+                pending.id,
+                resolved.version + 1,
+                original_date=date(2026, 11, 10),
+                resolution="remove",
+            )
+        with pytest.raises(ValueError, match="устарел"):
+            await reopened.resolve_schedule_change(
+                pending.id,
+                pending.version,
+                original_date=date(2026, 11, 10),
+                resolution="detach",
+            )
+        with pytest.raises(ValueError, match="устарела"):
+            await reopened.confirm_schedule_change(pending.id, pending.version, NOW)
+
+        await reopened.confirm_schedule_change(resolved.id, resolved.version, NOW)
+        assert await Store(store.path).list_pending_schedule_changes() == []
+        with pytest.raises(ValueError):
+            await reopened.resolve_schedule_change(
+                pending.id,
+                resolved.version,
+                original_date=date(2026, 11, 10),
+                resolution="remove",
+            )
 
     asyncio.run(scenario())

@@ -12,7 +12,7 @@ from aiogram.types import (
     Message,
 )
 
-from .cards import _chunks, format_card
+from .cards import _send_bound_text, format_card, show_source
 from .models import (
     CancelOccurrence,
     CardAction,
@@ -33,22 +33,19 @@ from .models import (
 )
 from .schedule import expand_schedule
 from .storage import Store
-from .templates import TemplateError, parse_class_template
+from .templates import TemplateError, parse_class_template, parse_strict_date
 
 _MOSCOW = ZoneInfo("Europe/Moscow")
-_DATE_PATTERN = re.compile(r"[0-9]{2}\.[0-9]{2}\.[0-9]{4}\Z")
 _TIME_PATTERN = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]\Z")
 
 
 def parse_schedule_date(value: str) -> date:
     """Проверить дату в строгом формате ДД.ММ.ГГГГ."""
-    if _DATE_PATTERN.fullmatch(value) is None:
-        raise ValueError("Введите дату строго в формате ДД.ММ.ГГГГ.")
-    day, month, year = (int(part) for part in value.split("."))
-    try:
-        return date(year, month, day)
-    except ValueError as error:
-        raise ValueError("Такой календарной даты не существует.") from error
+    return parse_strict_date(
+        value,
+        format_error="Введите дату строго в формате ДД.ММ.ГГГГ.",
+        invalid_error="Такой календарной даты не существует.",
+    )
 
 
 def _date_label(value: date) -> str:
@@ -133,33 +130,6 @@ async def _button(
     return InlineKeyboardButton(text=title, callback_data=f"a:{action.token}")
 
 
-async def _send_bound(
-    message: Message,
-    text: str,
-    store: Store,
-    *,
-    keyboard: InlineKeyboardMarkup | None = None,
-    binding: CardBinding | None = None,
-) -> None:
-    for index, chunk in enumerate(_chunks(text)):
-        sent = await message.answer(chunk, reply_markup=keyboard if index == 0 else None)
-        if binding is not None:
-            await store.bind_card_message(
-                binding.model_copy(
-                    update={"chat_id": sent.chat.id, "bot_message_id": sent.message_id}
-                )
-            )
-        if index == 0 and keyboard is not None:
-            tokens = [
-                button.callback_data.removeprefix("a:")
-                for row in keyboard.inline_keyboard
-                for button in row
-                if button.callback_data is not None and button.callback_data.startswith("a:")
-            ]
-            if tokens:
-                await store.bind_card_actions(sent.chat.id, sent.message_id, tokens)
-
-
 def _occurrence_text(occurrence: Occurrence, display_date: date) -> str:
     lines = [
         f"Проведение · {_date_label(display_date)} · {_time_label(occurrence.start_time)}",
@@ -193,6 +163,8 @@ async def show_schedule_week(message: Message, store: Store, week_start: date) -
     await message.answer(f"Расписание · {_date_label(week_start)} — {_date_label(last_weekday)}")
     if not versions:
         await message.answer("Регулярных занятий пока нет.")
+        for draft in await store.list_pending_schedule_changes():
+            await _schedule_draft_preview(message, draft, store)
         return
 
     versions_by_series: dict[int, list[SeriesVersion]] = {}
@@ -242,7 +214,7 @@ async def show_schedule_week(message: Message, store: Store, week_start: date) -
                     remove_poster=True,
                 )
             )
-        await _send_bound(
+        await _send_bound_text(
             message,
             "\n".join(lines),
             store,
@@ -295,7 +267,7 @@ async def show_schedule_week(message: Message, store: Store, week_start: date) -
                 )
             )
         keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else None
-        await _send_bound(
+        await _send_bound_text(
             message,
             _occurrence_text(occurrence, _display_date(occurrence, week_start)),
             store,
@@ -303,6 +275,8 @@ async def show_schedule_week(message: Message, store: Store, week_start: date) -
         )
     if not occurrences:
         await message.answer("На этой неделе нет регулярных проведений.")
+    for draft in await store.list_pending_schedule_changes():
+        await _schedule_draft_preview(message, draft, store)
 
 
 async def schedule_command_handler(message: Message, store: Store) -> None:
@@ -442,7 +416,7 @@ async def _schedule_draft_preview(message: Message, draft: ChangeDraft, store: S
             schedule_draft_id=draft.id,
             schedule_draft_version=draft.version,
         )
-        await _send_bound(
+        await _send_bound_text(
             message,
             text,
             store,
@@ -472,7 +446,7 @@ async def _schedule_draft_preview(message: Message, draft: ChangeDraft, store: S
         heading += "\n\nБудут замещены будущие версии:"
         for version in draft.superseded_versions:
             heading += f"\n• {version.revision} с {_date_label(version.effective_from)}"
-    await _send_bound(message, heading, store)
+    await _send_bound_text(message, heading, store)
 
     for exception in draft.affected_exceptions:
         choice = change.resolutions.get(exception.original_date)
@@ -511,7 +485,7 @@ async def _schedule_draft_preview(message: Message, draft: ChangeDraft, store: S
                     original_date=exception.original_date,
                 )
             )
-        await _send_bound(
+        await _send_bound_text(
             message,
             text,
             store,
@@ -545,7 +519,7 @@ async def _schedule_draft_preview(message: Message, draft: ChangeDraft, store: S
         if decisions_complete
         else "Выберите решение для каждого затронутого исключения перед подтверждением."
     )
-    await _send_bound(
+    await _send_bound_text(
         message,
         prompt,
         store,
@@ -567,6 +541,13 @@ async def handle_schedule_reply(
     if binding is None or binding.schedule_action is None:
         return False
     try:
+        if source.is_photo and binding.schedule_action in {"transfer_occurrence", "end_series"}:
+            instruction = (
+                "Для переноса занятия отправьте дату и время без фото."
+                if binding.schedule_action == "transfer_occurrence"
+                else "Для завершения серии отправьте последнюю дату без фото."
+            )
+            raise ValueError(f"{instruction} Фото сохранено в исходных сообщениях.")
         if binding.schedule_series_id is None or binding.schedule_revision is None:
             raise ValueError("Приглашение для изменения расписания повреждено.")
         now = datetime.now(_MOSCOW)
@@ -647,7 +628,7 @@ async def handle_schedule_reply(
         await store.mark_source_processed(source.id)
     except (ValueError, TemplateError) as error:
         await store.set_source_error(source.id, str(error))
-        await message.answer(str(error))
+        await show_source(message, await store.get_source_by_id(source.id) or source, store)
     return True
 
 
