@@ -337,22 +337,11 @@ def test_remove_poster_keeps_end_series_boundary_through_real_confirmation(
     asyncio.run(scenario())
 
 
-def test_repeated_detach_after_v3_migration_preserves_both_histories(tmp_path: Path) -> None:
+def test_repeated_detach_after_reopen_preserves_both_histories(tmp_path: Path) -> None:
     async def scenario() -> None:
-        database = tmp_path / "legacy-v3.sqlite3"
-        migration_dir = Path(__file__).parents[1] / "src" / "dance_community_bot" / "migrations"
-        with closing(sqlite3.connect(database)) as connection:
-            for migration_name in (
-                "001_initial.sql",
-                "002_intake.sql",
-                "003_schedule.sql",
-            ):
-                connection.executescript(
-                    (migration_dir / migration_name).read_text(encoding="utf-8")
-                )
-            connection.execute("PRAGMA user_version = 3")
-
+        database = tmp_path / "dance.sqlite3"
         store = Store(database)
+        await store.initialize()
         series_source = await store.save_source(
             SourceInput(
                 chat_id=111,
@@ -364,7 +353,6 @@ def test_repeated_detach_after_v3_migration_preserves_both_histories(tmp_path: P
             )
         )
         poster_path = Path("posters/class.jpg")
-        (database.parent / poster_path.parent).mkdir()
         await asyncio.to_thread((database.parent / poster_path).write_bytes, b"poster")
         await store.set_source_poster_path(series_source.id, poster_path)
         class_draft = await store.save_draft(
@@ -459,16 +447,16 @@ def test_repeated_detach_after_v3_migration_preserves_both_histories(tmp_path: P
         )
         await store.confirm_schedule_change(second_transfer.id, second_transfer.version, now)
 
-        migrated = Store(database)
-        await migrated.initialize()
-        await migrated.initialize()
+        reopened = Store(database)
+        await reopened.initialize()
+        await reopened.initialize()
         with closing(sqlite3.connect(database)) as connection:
             existing_links = connection.execute(
                 "SELECT event_record_id FROM detached_occurrence_links"
             ).fetchall()
         assert existing_links == [(first_event.id,)]
 
-        second_series_change = await migrated.propose_schedule_change(
+        second_series_change = await reopened.propose_schedule_change(
             ChangeSeries(
                 action="change_series",
                 series_id=series.id,
@@ -483,16 +471,16 @@ def test_repeated_detach_after_v3_migration_preserves_both_histories(tmp_path: P
             ),
             now,
         )
-        detached_draft = await migrated.resolve_schedule_change(
+        detached_draft = await reopened.resolve_schedule_change(
             second_series_change.id,
             second_series_change.version,
             original_date=date(2026, 11, 10),
             resolution="detach",
         )
-        await migrated.confirm_schedule_change(detached_draft.id, detached_draft.version, now)
-        await migrated.confirm_schedule_change(detached_draft.id, detached_draft.version, now)
+        await reopened.confirm_schedule_change(detached_draft.id, detached_draft.version, now)
+        await reopened.confirm_schedule_change(detached_draft.id, detached_draft.version, now)
 
-        records = await migrated.list_records()
+        records = await reopened.list_records()
         events = [record for record in records if isinstance(record.data, EventData)]
         assert len(events) == 2
         assert (
@@ -735,7 +723,7 @@ def test_schedule_read_keeps_one_snapshot_across_concurrent_confirmation(
     asyncio.run(scenario())
 
 
-def test_legacy_pending_class_edit_cannot_bypass_schedule_versions(tmp_path: Path) -> None:
+def test_pending_class_edit_cannot_bypass_schedule_versions(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = Store(tmp_path / "dance.sqlite3")
         series_id = await saved_series(store)

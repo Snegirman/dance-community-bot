@@ -46,86 +46,56 @@ def test_save_and_reopen_preserves_record_and_draft_history(tmp_path: Path) -> N
     asyncio.run(scenario())
 
 
-def test_initialize_can_apply_migrations_repeatedly(tmp_path: Path) -> None:
+def test_initialize_can_be_repeated_with_existing_data(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = Store(tmp_path / "dance.sqlite3")
         await store.initialize()
         await store.initialize()
         source = await store.save_source(make_source(1))
-        await store.initialize()
-        restored_source = await store.save_source(make_source(1))
+        reopened = Store(store.path)
+        await reopened.initialize()
+        restored_source = await reopened.save_source(make_source(1))
+        with closing(sqlite3.connect(store.path)) as connection:
+            version_row = connection.execute("PRAGMA user_version").fetchone()
 
         assert restored_source.id == source.id
+        assert version_row == (4,)
 
     asyncio.run(scenario())
 
 
-def test_initialize_upgrades_existing_v1_catalog_and_is_idempotent(tmp_path: Path) -> None:
+@pytest.mark.parametrize("schema_version", [1, 2, 3, 5])
+def test_initialize_rejects_unsupported_versions_without_changing_database(
+    tmp_path: Path, schema_version: int
+) -> None:
     async def scenario() -> None:
-        database = tmp_path / "legacy.sqlite3"
-        initial_schema = (
-            Path(__file__).parents[1]
-            / "src"
-            / "dance_community_bot"
-            / "migrations"
-            / "001_initial.sql"
-        ).read_text(encoding="utf-8")
-        source = make_source(1, "Событие до обновления")
-        data = make_event("Сохранённое событие")
+        database = tmp_path / "unsupported.sqlite3"
         with closing(sqlite3.connect(database)) as connection:
-            connection.executescript(initial_schema)
-            connection.execute("PRAGMA user_version = 1")
-            connection.execute(
-                "INSERT INTO sources "
-                "(id, chat_id, message_id, text, received_at, status) "
-                "VALUES (?, ?, ?, ?, ?, 'processed')",
-                (
-                    1,
-                    source.chat_id,
-                    source.message_id,
-                    source.text,
-                    source.received_at.isoformat(),
-                ),
-            )
-            connection.execute(
-                "INSERT INTO records "
-                "(id, revision, data_type, data_json, status) "
-                "VALUES (1, 1, 'event', ?, 'active')",
-                (data.model_dump_json(),),
-            )
-            connection.execute(
-                "INSERT INTO drafts "
-                "(id, record_id, version, base_revision, data_type, data_json, "
-                "source_id, status) "
-                "VALUES (1, 1, 1, NULL, 'event', ?, 1, 'confirmed')",
-                (data.model_dump_json(),),
-            )
+            connection.execute("CREATE TABLE existing_data (id INTEGER PRIMARY KEY, value TEXT)")
+            connection.execute("INSERT INTO existing_data (value) VALUES ('preserve me')")
+            connection.execute(f"PRAGMA user_version = {schema_version}")
+            schema_before = connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            ).fetchall()
             connection.commit()
 
-        store = Store(database)
-        await store.initialize()
-        await store.initialize()
+        with pytest.raises(RuntimeError, match="Неподдерживаемая версия схемы"):
+            await Store(database).initialize()
 
-        restored_source = await store.get_source(source.chat_id, source.message_id)
-        restored_record = await store.get_record(1)
-        restored_draft = await store.get_draft(1)
-        action = await store.create_card_action("view", record_id=1, revision=1)
-        await store.bind_card_actions(source.chat_id, 101, [action.token])
-        bound_action = await store.get_card_action(action.token)
         with closing(sqlite3.connect(database)) as connection:
+            schema_after = connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            ).fetchall()
+            data_after = connection.execute(
+                "SELECT id, value FROM existing_data ORDER BY id"
+            ).fetchall()
             version_row = connection.execute("PRAGMA user_version").fetchone()
 
-        assert restored_source is not None
-        assert restored_source.status == "processed"
-        assert restored_source.attachment_status == "none"
-        assert not restored_source.is_photo
-        assert restored_record is not None and restored_record.data == data
-        assert restored_draft is not None and restored_draft.status == "confirmed"
-        assert restored_draft.data == data
-        assert bound_action is not None
-        assert bound_action.chat_id == source.chat_id
-        assert bound_action.bot_message_id == 101
-        assert version_row == (4,)
+        assert schema_after == schema_before
+        assert data_after == [(1, "preserve me")]
+        assert version_row == (schema_version,)
 
     asyncio.run(scenario())
 

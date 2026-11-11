@@ -692,64 +692,6 @@ def test_change_series_confirmation_rechecks_new_affected_exceptions(tmp_path: P
     asyncio.run(scenario())
 
 
-def test_migration_backfills_active_class_records_as_series_versions(tmp_path: Path) -> None:
-    database = tmp_path / "legacy.sqlite3"
-    data = ClassData(
-        title="Waving",
-        first_date=date(2026, 11, 12),
-        last_date=date(2026, 12, 3),
-        start_time=time(20),
-    )
-    source = SourceInput(
-        chat_id=111,
-        message_id=1,
-        text="Старое занятие",
-        received_at=datetime(2026, 11, 9, 9, tzinfo=UTC),
-    )
-    initial_schema = (
-        Path(__file__).parents[1] / "src" / "dance_community_bot" / "migrations" / "001_initial.sql"
-    ).read_text(encoding="utf-8")
-    intake_schema = (
-        Path(__file__).parents[1] / "src" / "dance_community_bot" / "migrations" / "002_intake.sql"
-    ).read_text(encoding="utf-8")
-    with closing(sqlite3.connect(database)) as connection:
-        connection.executescript(initial_schema)
-        connection.executescript(intake_schema)
-        connection.execute("PRAGMA user_version = 2")
-        connection.execute(
-            "INSERT INTO sources (chat_id, message_id, text, received_at, status) "
-            "VALUES (?, ?, ?, ?, 'processed')",
-            (source.chat_id, source.message_id, source.text, source.received_at.isoformat()),
-        )
-        connection.execute(
-            "INSERT INTO records (revision, data_type, data_json, status) "
-            "VALUES (4, 'class', ?, 'active')",
-            (data.model_dump_json(),),
-        )
-        connection.execute(
-            "INSERT INTO drafts (record_id, version, base_revision, data_type, data_json, "
-            "source_id, status) VALUES (1, 1, NULL, 'class', ?, 1, 'confirmed')",
-            (data.model_dump_json(),),
-        )
-        connection.commit()
-
-    async def scenario() -> None:
-        store = Store(database)
-        await store.initialize()
-        versions, exceptions = await store.get_schedule()
-        assert exceptions == []
-        assert len(versions) == 1
-        assert (
-            versions[0].series_id,
-            versions[0].revision,
-            versions[0].effective_from,
-            versions[0].effective_until,
-            versions[0].source_id,
-        ) == (1, 4, date(2026, 11, 12), date(2026, 12, 4), 1)
-
-    asyncio.run(scenario())
-
-
 def test_active_class_cannot_be_changed_through_generic_card_draft(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = Store(tmp_path / "dance.sqlite3")

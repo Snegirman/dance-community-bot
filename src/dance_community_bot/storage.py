@@ -241,11 +241,7 @@ class Store:
     def _initialize_sync(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         (self.path.parent / "posters").mkdir(parents=True, exist_ok=True)
-        migration = (
-            files("dance_community_bot")
-            .joinpath("migrations", "001_initial.sql")
-            .read_text(encoding="utf-8")
-        )
+        schema = files("dance_community_bot").joinpath("schema.sql").read_text(encoding="utf-8")
 
         with self._transaction() as connection:
             row = connection.execute("PRAGMA user_version").fetchone()
@@ -254,43 +250,12 @@ class Store:
             schema_version = row[0]
             if not isinstance(schema_version, int):
                 raise RuntimeError("Некорректная версия схемы базы данных.")
-            if schema_version > 4:
-                raise RuntimeError("Версия схемы базы данных новее поддерживаемой.")
+            if schema_version not in (0, 4):
+                raise RuntimeError(
+                    f"Неподдерживаемая версия схемы базы данных: {schema_version}. Ожидается 4."
+                )
             if schema_version == 0:
-                for statement in migration.split(";"):
-                    if statement.strip():
-                        connection.execute(statement)
-                schema_version = 1
-                connection.execute("PRAGMA user_version = 1")
-            if schema_version < 2:
-                intake_migration = (
-                    files("dance_community_bot")
-                    .joinpath("migrations", "002_intake.sql")
-                    .read_text(encoding="utf-8")
-                )
-                for statement in intake_migration.split(";"):
-                    if statement.strip():
-                        connection.execute(statement)
-                connection.execute("PRAGMA user_version = 2")
-                schema_version = 2
-            if schema_version < 3:
-                schedule_migration = (
-                    files("dance_community_bot")
-                    .joinpath("migrations", "003_schedule.sql")
-                    .read_text(encoding="utf-8")
-                )
-                for statement in schedule_migration.split(";"):
-                    if statement.strip():
-                        connection.execute(statement)
-                connection.execute("PRAGMA user_version = 3")
-                schema_version = 3
-            if schema_version < 4:
-                detached_links_migration = (
-                    files("dance_community_bot")
-                    .joinpath("migrations", "004_detached_occurrence_links.sql")
-                    .read_text(encoding="utf-8")
-                )
-                for statement in detached_links_migration.split(";"):
+                for statement in schema.split(";"):
                     if statement.strip():
                         connection.execute(statement)
                 connection.execute("PRAGMA user_version = 4")
