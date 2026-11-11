@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import html
 from collections.abc import AsyncGenerator, Iterator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, tzinfo
 from pathlib import Path
 
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import AnswerCallbackQuery, SendMessage, TelegramMethod
+from aiogram.methods import AnswerCallbackQuery, SendMessage, SendPhoto, TelegramMethod
 from aiogram.methods.base import TelegramType
-from aiogram.types import CallbackQuery, Chat, InlineKeyboardMarkup, Message, Update, User
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    FSInputFile,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+    User,
+)
 from pydantic import SecretStr, ValidationError
 
+from dance_community_bot import weekly
 from dance_community_bot.access import is_owner_private
 from dance_community_bot.bot import create_dispatcher
 from dance_community_bot.cards import show_draft
@@ -27,7 +37,7 @@ TOKEN = "987654:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno"
 class RecordingSession(BaseSession):
     def __init__(self) -> None:
         super().__init__()
-        self.requests: list[SendMessage | AnswerCallbackQuery] = []
+        self.requests: list[SendMessage | SendPhoto | AnswerCallbackQuery] = []
         self.closed = False
 
     async def close(self) -> None:
@@ -49,6 +59,25 @@ class RecordingSession(BaseSession):
                 "chat": {"id": method.chat_id, "type": "private"},
                 "text": method.text,
             }
+        elif isinstance(method, SendPhoto):
+            if not isinstance(method.chat_id, int):
+                raise AssertionError("The test sends photos only to numeric chats")
+            photo_result: dict[str, object] = {
+                "message_id": 1,
+                "date": 1793782800,
+                "chat": {"id": method.chat_id, "type": "private"},
+                "photo": [
+                    {
+                        "file_id": "photo-test",
+                        "file_unique_id": "photo-test-unique",
+                        "width": 100,
+                        "height": 100,
+                    }
+                ],
+            }
+            if method.caption is not None:
+                photo_result["caption"] = method.caption
+            result = photo_result
         elif isinstance(method, AnswerCallbackQuery):
             result = True
         else:
@@ -211,6 +240,131 @@ def test_intake_commands_are_available_to_owner(
     assert expected in "\n".join(message_texts(session))
 
 
+@pytest.mark.parametrize(
+    ("command", "event_date"),
+    [
+        ("/preview", date(2026, 11, 9)),
+        ("/preview 18.11.2026", date(2026, 11, 18)),
+        ("/preview\n18.11.2026", date(2026, 11, 18)),
+        ("/preview\t18.11.2026", date(2026, 11, 18)),
+    ],
+)
+def test_preview_selects_current_moscow_week_or_explicit_date(
+    client: tuple[Bot, RecordingSession],
+    app: tuple[Dispatcher, Store],
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    event_date: date,
+) -> None:
+    bot, session = client
+    dispatcher, store = app
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            value = cls(2026, 11, 8, 21, 30, tzinfo=UTC)
+            return value.astimezone(tz) if tz is not None else value
+
+    async def prepare_event() -> None:
+        source = await store.save_source(
+            SourceInput(
+                chat_id=OWNER_ID,
+                message_id=50,
+                text="исходник",
+                received_at=datetime.now(UTC),
+            )
+        )
+        draft = await store.save_draft(
+            source.id,
+            EventData(
+                title="Событие выбранной недели",
+                event_type="Джем",
+                start_date=event_date,
+            ),
+            poster_source_id=None,
+        )
+        await store.confirm_draft(draft.id, draft.version)
+
+    asyncio.run(prepare_event())
+    monkeypatch.setattr(weekly, "datetime", FrozenDateTime)
+    feed(dispatcher, bot, make_message_update(update_id=51, text=command))
+
+    assert "Событие выбранной недели" in "\n".join(message_texts(session))
+
+
+def test_preview_sends_photo_and_preserves_long_escaped_content(
+    client: tuple[Bot, RecordingSession],
+    app: tuple[Dispatcher, Store],
+) -> None:
+    bot, session = client
+    dispatcher, store = app
+    description = "🪩<>&" * 1200 + "\nфинал <>&"
+
+    async def prepare_event() -> None:
+        source = await store.save_source(
+            SourceInput(
+                chat_id=OWNER_ID,
+                message_id=60,
+                text="личный исходный текст не включается в пост",
+                received_at=datetime.now(UTC),
+                telegram_file_id="poster-file",
+                is_photo=True,
+            )
+        )
+        poster_path = Path("posters") / "poster.jpg"
+        await asyncio.to_thread((store.path.parent / poster_path).write_bytes, b"poster")
+        await store.set_source_poster_path(source.id, poster_path)
+        draft = await store.save_draft(
+            source.id,
+            EventData(
+                title="Jam 🪩 <>&",
+                event_type="Джем",
+                start_date=date(2026, 11, 14),
+                description=description,
+            ),
+            poster_source_id=source.id,
+        )
+        await store.confirm_draft(draft.id, draft.version)
+
+    asyncio.run(prepare_event())
+    feed(dispatcher, bot, make_message_update(update_id=61, text="/preview 14.11.2026"))
+
+    photos = [method for method in session.requests if isinstance(method, SendPhoto)]
+    messages = [method for method in session.requests if isinstance(method, SendMessage)]
+    assert len(photos) == 1
+    assert isinstance(photos[0].photo, FSInputFile)
+    assert photos[0].photo.path.resolve() == (store.path.parent / "posters/poster.jpg")
+    assert photos[0].caption is not None
+    assert "&lt;&gt;&amp;" in photos[0].caption
+    assert "личный исходный текст" not in "".join(
+        method.text if isinstance(method, SendMessage) else method.caption or ""
+        for method in session.requests
+        if isinstance(method, (SendMessage, SendPhoto))
+    )
+    assert all(
+        len(html.unescape(method.text).encode("utf-16-le")) // 2 <= 4096 for method in messages
+    )
+    assert len(html.unescape(photos[0].caption).encode("utf-16-le")) // 2 <= 1024
+    delivered = "".join(
+        html.unescape(method.text if isinstance(method, SendMessage) else method.caption or "")
+        for method in session.requests
+        if isinstance(method, (SendMessage, SendPhoto))
+    )
+    assert description in delivered
+    assert "<>&" in delivered
+
+
+def test_preview_reports_invalid_date_to_owner(
+    client: tuple[Bot, RecordingSession], app: tuple[Dispatcher, Store]
+) -> None:
+    bot, session = client
+    dispatcher, _ = app
+
+    feed(dispatcher, bot, make_message_update(update_id=62, text="/preview 31.02.2026"))
+
+    assert "календарной даты" in "\n".join(message_texts(session))
+
+
 def test_help_only_lists_implemented_input_routes(
     client: tuple[Bot, RecordingSession], app: tuple[Dispatcher, Store]
 ) -> None:
@@ -248,7 +402,9 @@ def test_owner_malformed_material_is_saved_without_creating_catalog_record(
         (None, "private"),
     ],
 )
-@pytest.mark.parametrize("text", ["материал", "/help", "/start", "/schedule 09.11.2026"])
+@pytest.mark.parametrize(
+    "text", ["материал", "/help", "/start", "/schedule 09.11.2026", "/preview"]
+)
 def test_disallowed_messages_are_ignored(
     client: tuple[Bot, RecordingSession],
     app: tuple[Dispatcher, Store],

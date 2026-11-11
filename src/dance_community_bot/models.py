@@ -293,6 +293,42 @@ class Record(BaseModel):
     status: Literal["pending", "active", "cancelled"]
 
 
+class TextPostPart(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["text"] = "text"
+    text: str
+
+
+class PhotoPostPart(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["photo"] = "photo"
+    poster_source_id: int
+    poster_path: Path
+    caption: str
+
+    @field_validator("poster_path")
+    @classmethod
+    def validate_relative_poster_path(cls, path: Path) -> Path:
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("Путь афиши должен быть относительным.")
+        return path
+
+
+PostPart = Annotated[TextPostPart | PhotoPostPart, Field(discriminator="kind")]
+
+
+class WeeklyPost(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    week_start: date
+    catalog_revision: str
+    parts: tuple[PostPart, ...]
+    records: tuple[Record, ...]
+    occurrences: tuple[Occurrence, ...]
+
+
 CardActionName = Literal[
     "confirm",
     "edit",
