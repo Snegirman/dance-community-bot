@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from pydantic import SecretStr, ValidationError, field_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     telegram_webhook_secret: SecretStr
     webhook_port: int = 8080
     database_path: Path = Path("data/dance-community-bot.sqlite3")
+    telegram_group_id: int | None = Field(default=None, gt=-(2**52), lt=0)
+
+    @field_validator("telegram_group_id", mode="before")
+    @classmethod
+    def normalize_telegram_group_id(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @field_validator("telegram_bot_token")
     @classmethod
@@ -86,9 +94,10 @@ class SettingsError(Exception):
 def load_settings() -> Settings:
     """Загрузить настройки из окружения и .env из текущего каталога."""
     try:
-        return Settings()
+        return Settings.model_validate({})
     except ValidationError:
         raise SettingsError(
             "Ошибка настроек: проверьте TELEGRAM_BOT_TOKEN, TELEGRAM_OWNER_ID, "
-            "TELEGRAM_WEBHOOK_URL, TELEGRAM_WEBHOOK_SECRET и WEBHOOK_PORT."
+            "TELEGRAM_WEBHOOK_URL, TELEGRAM_WEBHOOK_SECRET, WEBHOOK_PORT "
+            "и TELEGRAM_GROUP_ID."
         ) from None

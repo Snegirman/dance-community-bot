@@ -3,9 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from dance_community_bot.__main__ import main
-from dance_community_bot.config import SettingsError, load_settings
+from dance_community_bot.config import Settings, SettingsError, load_settings
 
 
 def test_webhook_settings_are_required(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -17,6 +18,37 @@ def test_webhook_settings_are_required(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     with pytest.raises(SettingsError):
         load_settings()
+
+
+def test_telegram_group_id_can_be_empty_or_a_numeric_target(tmp_path: Path) -> None:
+    shared = {
+        "telegram_bot_token": "123456:dotenvsecret",
+        "telegram_owner_id": 111,
+        "telegram_webhook_url": "https://dance.example.org/telegram/webhook",
+        "telegram_webhook_secret": "dotenv_hook_secret",
+        "database_path": tmp_path / "dance.sqlite3",
+    }
+
+    without_group = Settings(**shared, telegram_group_id="")
+    with_group = Settings(**shared, telegram_group_id="-100123")
+
+    assert without_group.telegram_group_id is None
+    assert with_group.telegram_group_id == -100123
+
+
+@pytest.mark.parametrize("group_id", [0, 1, -(2**52), 2**52])
+def test_telegram_group_id_rejects_non_group_or_out_of_range_values(
+    tmp_path: Path, group_id: int
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            telegram_bot_token="123456:dotenvsecret",
+            telegram_owner_id=111,
+            telegram_webhook_url="https://dance.example.org/telegram/webhook",
+            telegram_webhook_secret="dotenv_hook_secret",
+            database_path=tmp_path / "dance.sqlite3",
+            telegram_group_id=group_id,
+        )
 
 
 @pytest.mark.parametrize("source", ["dotenv", "environment"])

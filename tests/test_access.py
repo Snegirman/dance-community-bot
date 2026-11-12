@@ -224,6 +224,7 @@ def test_commands_work_without_prior_start_and_explain_current_limits(
         ("/class", "Первая дата: 10.11.2026"),
         ("/events", "Страница 1 из 1"),
         ("/schedule 09.11.2026", "Расписание"),
+        ("/publish 09.11.2026", "TELEGRAM_GROUP_ID"),
     ],
 )
 def test_intake_commands_are_available_to_owner(
@@ -374,7 +375,7 @@ def test_help_only_lists_implemented_input_routes(
     feed(dispatcher, bot, make_message_update(update_id=21, text="/help"))
 
     text = "\n".join(message_texts(session))
-    assert all(command in text for command in ("/event", "/class", "/events"))
+    assert all(command in text for command in ("/event", "/class", "/events", "/publish"))
     assert "ещё не реализ" not in text.lower()
 
 
@@ -403,7 +404,8 @@ def test_owner_malformed_material_is_saved_without_creating_catalog_record(
     ],
 )
 @pytest.mark.parametrize(
-    "text", ["материал", "/help", "/start", "/schedule 09.11.2026", "/preview"]
+    "text",
+    ["материал", "/help", "/start", "/schedule 09.11.2026", "/preview", "/publish"],
 )
 def test_disallowed_messages_are_ignored(
     client: tuple[Bot, RecordingSession],

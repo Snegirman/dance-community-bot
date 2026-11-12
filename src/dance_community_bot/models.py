@@ -329,6 +329,51 @@ class WeeklyPost(BaseModel):
     occurrences: tuple[Occurrence, ...]
 
 
+PublicationStatus = Literal["prepared", "sending", "partial", "unknown", "delivered"]
+PublicationPartStatus = Literal["prepared", "sending", "sent", "failed", "unknown"]
+
+
+class PublicationPartState(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    index: int
+    part: PostPart
+    status: PublicationPartStatus
+    attempt_revision: int
+    message_id: int | None
+
+
+class PublicationState(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: int
+    group_id: int
+    week_start: date
+    catalog_revision: str
+    snapshot: WeeklyPost
+    status: PublicationStatus
+    preview_revision: int
+    owner_chat_id: int | None
+    owner_message_id: int | None
+    active_token: str | None
+    parts: tuple[PublicationPartState, ...]
+
+
+class PublicationPreviewResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    outcome: Literal["ready", "stale", "existing"]
+    publication: PublicationState | None
+
+
+class PublicationClaimResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    outcome: Literal["claimed", "stale", "existing", "invalid"]
+    publication: PublicationState | None
+    part: PublicationPartState | None
+
+
 CardActionName = Literal[
     "confirm",
     "edit",

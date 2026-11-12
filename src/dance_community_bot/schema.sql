@@ -176,3 +176,34 @@ CREATE TABLE detached_occurrence_links (
     exception_source_id INTEGER REFERENCES sources(id) ON DELETE RESTRICT,
     poster_source_id INTEGER REFERENCES sources(id) ON DELETE RESTRICT
 );
+
+CREATE TABLE publications (
+    id INTEGER PRIMARY KEY,
+    group_id INTEGER NOT NULL,
+    week_start TEXT NOT NULL,
+    catalog_revision TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('prepared', 'sending', 'partial', 'unknown', 'delivered')
+    ),
+    preview_revision INTEGER NOT NULL CHECK (preview_revision > 0),
+    owner_chat_id INTEGER,
+    owner_message_id INTEGER,
+    active_token TEXT,
+    UNIQUE (group_id, week_start)
+);
+
+CREATE TABLE publication_parts (
+    publication_id INTEGER NOT NULL REFERENCES publications(id) ON DELETE CASCADE,
+    part_index INTEGER NOT NULL CHECK (part_index >= 0),
+    part_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('prepared', 'sending', 'sent', 'failed', 'unknown')
+    ),
+    attempt_revision INTEGER NOT NULL DEFAULT 0 CHECK (attempt_revision >= 0),
+    message_id INTEGER,
+    PRIMARY KEY (publication_id, part_index)
+);
+
+CREATE INDEX publication_parts_by_status
+    ON publication_parts (publication_id, status, part_index);

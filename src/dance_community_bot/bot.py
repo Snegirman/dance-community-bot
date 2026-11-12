@@ -1,6 +1,6 @@
 """Создание Telegram-диспетчера и доступные команды."""
 
-from aiogram import Dispatcher
+from aiogram import Dispatcher, F
 from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.types import CallbackQuery, Message
 
@@ -8,6 +8,10 @@ from dance_community_bot.access import is_owner_private
 from dance_community_bot.cards import show_events
 from dance_community_bot.config import Settings
 from dance_community_bot.intake import handle_card_action, ingest_message
+from dance_community_bot.publication_handlers import (
+    publication_callback_handler,
+    publish_command_handler,
+)
 from dance_community_bot.schedule_handlers import schedule_command_handler
 from dance_community_bot.storage import Store
 from dance_community_bot.weekly import preview_command_handler
@@ -20,6 +24,7 @@ HELP_TEXT = (
     "/events — активные записи, черновики и незавершённые сообщения\n"
     "/schedule [ДД.ММ.ГГГГ] — расписание недели и изменения серий\n"
     "/preview [ДД.ММ.ГГГГ] — предпросмотр публикации за неделю\n"
+    "/publish [ДД.ММ.ГГГГ] — предпросмотр и ручная публикация недели\n"
     "/help — эта справка"
 )
 EVENT_TEMPLATE = """Название: Popping Jam
@@ -92,11 +97,13 @@ def create_dispatcher(settings: Settings, store: Store) -> Dispatcher:
     """Создать диспетчер с барьером доступа и постоянным хранилищем."""
     dispatcher = Dispatcher()
     dispatcher["store"] = store
+    dispatcher["settings"] = settings
     access_filter = OwnerPrivateFilter(settings.telegram_owner_id)
     dispatcher.message.filter(access_filter)
     dispatcher.edited_message.filter(access_filter)
     dispatcher.callback_query.filter(access_filter)
     dispatcher.startup.register(store.initialize)
+    dispatcher.startup.register(store.recover_publications_on_startup)
     dispatcher.message.register(start_handler, CommandStart())
     dispatcher.message.register(help_handler, Command("help"))
     dispatcher.message.register(event_template_handler, Command("event"))
@@ -104,7 +111,9 @@ def create_dispatcher(settings: Settings, store: Store) -> Dispatcher:
     dispatcher.message.register(events_handler, Command("events"))
     dispatcher.message.register(schedule_handler, Command("schedule"))
     dispatcher.message.register(preview_handler, Command("preview"))
+    dispatcher.message.register(publish_command_handler, Command("publish"))
     dispatcher.message.register(intake_handler)
     dispatcher.edited_message.register(intake_handler)
+    dispatcher.callback_query.register(publication_callback_handler, F.data.startswith("pub:"))
     dispatcher.callback_query.register(card_action_handler)
     return dispatcher
