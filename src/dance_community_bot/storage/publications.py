@@ -23,6 +23,43 @@ from .snapshots import SnapshotsStorage
 _POST_PART_ADAPTER = TypeAdapter(PostPart)
 
 
+def _queue_interrupted_publication_notification(
+    connection: sqlite3.Connection, publication_id: int
+) -> None:
+    publication = connection.execute(
+        "SELECT group_id, week_start, status, notification_revision FROM publications WHERE id = ?",
+        (publication_id,),
+    ).fetchone()
+    if publication is None or publication["status"] not in ("partial", "unknown"):
+        return
+
+    week_start = date.fromisoformat(publication["week_start"])
+    week_label = f"{week_start.day:02d}.{week_start.month:02d}.{week_start.year:04d}"
+    message = [
+        f"Отправка публикации в группу {publication['group_id']} "
+        f"за неделю с {week_label} не завершена."
+    ]
+    if publication["status"] == "unknown":
+        message.append(
+            "Доставка неизвестна. Проверьте группу вручную: публикация могла пройти, "
+            "повтор может создать дубль."
+        )
+    else:
+        message.append("Часть публикации не отправлена.")
+    message.append(f"Для восстановления выполните /publish {week_label}.")
+
+    revision = publication["notification_revision"] + 1
+    connection.execute(
+        "UPDATE publications SET notification_revision = ? WHERE id = ?",
+        (revision, publication_id),
+    )
+    connection.execute(
+        "INSERT INTO publication_notifications "
+        "(publication_id, revision, message_text, status) VALUES (?, ?, ?, 'pending')",
+        (publication_id, revision, "\n\n".join(message)),
+    )
+
+
 class PublicationsStorage(SnapshotsStorage):
     async def prepare_publication(
         self,
@@ -829,6 +866,7 @@ class PublicationsStorage(SnapshotsStorage):
                 "UPDATE publications SET status = ?, active_token = NULL WHERE id = ?",
                 (status, publication_id),
             )
+            _queue_interrupted_publication_notification(connection, publication_id)
 
     def _resolve_publication_part_sync(
         self,
@@ -1005,6 +1043,7 @@ class PublicationsStorage(SnapshotsStorage):
                     "UPDATE publications SET status = 'unknown', active_token = NULL WHERE id = ?",
                     (row["publication_id"],),
                 )
+                _queue_interrupted_publication_notification(connection, row["publication_id"])
             interrupted = connection.execute(
                 "SELECT id FROM publications WHERE active_token IS NOT NULL"
             ).fetchall()
@@ -1026,3 +1065,4 @@ class PublicationsStorage(SnapshotsStorage):
                     "UPDATE publications SET status = ?, active_token = NULL WHERE id = ?",
                     (status, row["id"]),
                 )
+                _queue_interrupted_publication_notification(connection, row["id"])

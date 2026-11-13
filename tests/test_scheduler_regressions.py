@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import closing
 from datetime import date, datetime, time
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -79,6 +80,13 @@ def scheduler_notice_kinds(database_path: Path) -> list[tuple[str, str]]:
         ).fetchall()
 
 
+def publication_notification_rows(database_path: Path) -> list[tuple[int, str, str]]:
+    with closing(sqlite3.connect(database_path)) as connection:
+        return connection.execute(
+            "SELECT revision, status, message_text FROM publication_notifications ORDER BY revision"
+        ).fetchall()
+
+
 def test_scheduler_catches_midnight_target_across_sunday_boundary(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = Store(tmp_path / "dance.sqlite3")
@@ -97,6 +105,7 @@ def test_scheduler_catches_midnight_target_across_sunday_boundary(tmp_path: Path
         assert publication is not None
         assert publication.status == "delivered"
         assert message_count(session, GROUP_ID) == 1
+        assert publication_notification_rows(store.path) == []
         await bot.session.close()
 
     asyncio.run(scenario())
@@ -297,6 +306,25 @@ class LoseGroupResponseSession(RecordingSession):
         return result
 
 
+class LoseGroupAndOwnerResponseSession(LoseGroupResponseSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.owner_attempts = 0
+
+    async def make_request(
+        self,
+        bot: Bot,
+        method: TelegramMethod[TelegramType],
+        timeout: int | None = None,
+    ) -> TelegramType:
+        result = await super().make_request(bot, method, timeout)
+        if isinstance(method, SendMessage) and method.chat_id == OWNER_ID:
+            self.owner_attempts += 1
+            if self.owner_attempts == 1:
+                raise TimeoutError("reply lost after possible owner notification")
+        return result
+
+
 def test_unknown_automatic_group_delivery_is_not_retried(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = Store(tmp_path / "dance.sqlite3")
@@ -318,6 +346,138 @@ def test_unknown_automatic_group_delivery_is_not_retried(tmp_path: Path) -> None
         assert publication is not None
         assert publication.status == "unknown"
         assert session.group_attempts == 1
+        owner_notices = [
+            request.text
+            for request in session.requests
+            if isinstance(request, SendMessage) and request.chat_id == OWNER_ID
+        ]
+        assert len(owner_notices) == 1
+        assert "/publish 09.11.2026" in owner_notices[0]
+        await bot.session.close()
+
+    asyncio.run(scenario())
+
+
+def test_partial_release_queues_owner_notification_only_once(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        await store.initialize()
+        await add_event(store)
+        post = await build_weekly_post(date(2026, 11, 9), store)
+        claim = await store.claim_publication(post, GROUP_ID, "partial-attempt")
+        assert claim.publication is not None and claim.part is not None
+
+        await store.finish_publication_part(
+            claim.publication.id, claim.part.index, "partial-attempt", "failed"
+        )
+        await store.release_publication_claim(claim.publication.id, "partial-attempt")
+        await store.release_publication_claim(claim.publication.id, "partial-attempt")
+
+        publication = await store.get_publication(claim.publication.id)
+        notifications = await store.list_pending_publication_notifications()
+        assert publication is not None and publication.status == "partial"
+        assert len(notifications) == 1
+        assert str(GROUP_ID) in notifications[0].text
+        assert "09.11.2026" in notifications[0].text
+        assert "/publish 09.11.2026" in notifications[0].text
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_status"),
+    [(None, "unknown"), ("failed", "partial"), ("unknown", "unknown")],
+)
+def test_interrupted_publication_startup_enqueues_one_notice_and_keeps_sent_parts(
+    tmp_path: Path,
+    outcome: Literal["failed", "unknown"] | None,
+    expected_status: Literal["partial", "unknown"],
+) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "dance.sqlite3"
+        store = Store(database)
+        await store.initialize()
+        await add_event(store, description="🙂" * 5000)
+        post = await build_weekly_post(date(2026, 11, 9), store)
+        assert len(post.parts) >= 2
+
+        claim = await store.claim_publication(post, GROUP_ID, "interrupted-attempt")
+        assert claim.publication is not None and claim.part is not None
+        await store.finish_publication_part(
+            claim.publication.id,
+            claim.part.index,
+            "interrupted-attempt",
+            "sent",
+            501,
+        )
+        next_claim = await store.claim_next_publication_part(
+            claim.publication.id, "interrupted-attempt"
+        )
+        assert next_claim.part is not None
+
+        if outcome is not None:
+            await store.finish_publication_part(
+                claim.publication.id, next_claim.part.index, "interrupted-attempt", outcome
+            )
+
+        reopened = Store(database)
+        await reopened.initialize()
+        await reopened.recover_publications_on_startup()
+        await reopened.recover_publications_on_startup()
+
+        publication = await reopened.get_publication(claim.publication.id)
+        notices = publication_notification_rows(database)
+        assert publication is not None and publication.status == expected_status
+        assert publication.active_token is None
+        assert publication.parts[0].status == "sent"
+        assert publication.parts[0].message_id == 501
+        assert len(notices) == 1
+        assert notices[0][1] == "pending"
+        assert "/publish 09.11.2026" in notices[0][2]
+
+    asyncio.run(scenario())
+
+
+def test_failed_owner_publication_notice_retries_after_restart_without_group_retry(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "dance.sqlite3"
+        store = Store(database)
+        await store.initialize(time(9, 0))
+        await add_event(store)
+        settings = make_settings(database, time(9, 0))
+        session = LoseGroupAndOwnerResponseSession()
+        bot = create_bot(session)
+
+        await check_publication(
+            datetime(2026, 11, 9, 8, 59, 55, tzinfo=MOSCOW), settings, store, bot
+        )
+        await check_publication(datetime(2026, 11, 9, 9, 0, 5, tzinfo=MOSCOW), settings, store, bot)
+        pending = publication_notification_rows(database)
+        assert len(pending) == 1
+        assert pending[0][1] == "pending"
+
+        reopened = Store(database)
+        await reopened.initialize()
+        await reopened.recover_publications_on_startup()
+        await check_publication(
+            datetime(2026, 11, 9, 9, 0, 15, tzinfo=MOSCOW), settings, reopened, bot
+        )
+        await check_publication(
+            datetime(2026, 11, 9, 9, 0, 25, tzinfo=MOSCOW), settings, reopened, bot
+        )
+
+        publication = await reopened.get_publication_for_week(GROUP_ID, date(2026, 11, 9))
+        notifications = publication_notification_rows(database)
+        assert publication is not None and publication.status == "unknown"
+        assert session.group_attempts == 1
+        assert session.owner_attempts == 2
+        assert message_count(session, GROUP_ID) == 1
+        assert message_count(session, OWNER_ID) == 2
+        assert len(notifications) == 1
+        assert notifications[0][1] == "sent"
+
         await bot.session.close()
 
     asyncio.run(scenario())

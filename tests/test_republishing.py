@@ -819,3 +819,180 @@ def test_new_republish_request_recovers_pending_repeat_when_catalog_is_empty(
             await bot.session.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["unknown", "failed"])
+def test_publish_old_week_recovers_incomplete_repeat_after_week_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: Literal["unknown", "failed"]
+) -> None:
+    class FrozenDatetime(datetime):
+        current = NOW
+
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            return (
+                cls.current.astimezone(tz) if tz is not None else cls.current.replace(tzinfo=None)
+            )
+
+    monkeypatch.setattr(publication_handlers, "datetime", FrozenDatetime)
+
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        await store.initialize()
+        await add_photo_event(store)
+        await add_text_event(
+            store,
+            message_id=4,
+            title="Вторая афиша без картинки",
+            event_date=date(2026, 11, 11),
+        )
+        post = await build_weekly_post(WEEK_START, store)
+        assert len(post.parts) >= 3
+        session = RecordingSession(OWNER_ID)
+        bot = Bot(token=TOKEN, session=session)
+        original_result = await publish_week(post, GROUP_ID, store, bot)
+        assert original_result.status == "delivered"
+        original = await store.get_publication_for_week(GROUP_ID, WEEK_START)
+        assert original is not None
+        original_parts = original.parts
+
+        pending_result = await store.prepare_republication(
+            post, GROUP_ID, original.id, OWNER_ID, 49
+        )
+        repeat = pending_result.publication
+        assert repeat is not None and repeat.status == "prepared"
+        dispatcher = create_dispatcher(make_settings(store.path), store)
+        await dispatcher.feed_update(
+            bot,
+            Update(update_id=1, message=private_message(bot, 48, "/publish 09.11.2026")),
+        )
+        assert _republish_confirmation(session) is None
+        assert any(
+            isinstance(request, SendMessage)
+            and request.chat_id == OWNER_ID
+            and "Выпуск недели с 09.11.2026: доставлен." in request.text
+            for request in session.requests
+        )
+
+        repeat = await store.bind_publication_message(
+            repeat.id, repeat.preview_revision, OWNER_ID, 49
+        )
+        assert repeat is not None
+        active_token = "interrupted-repeat"
+        claim = await store.claim_publication(
+            post,
+            GROUP_ID,
+            active_token,
+            expected_publication_id=repeat.id,
+            expected_preview_revision=repeat.preview_revision,
+            owner_chat_id=OWNER_ID,
+            owner_message_id=49,
+        )
+        assert claim.outcome == "claimed" and claim.part is not None
+        await store.finish_publication_part(
+            repeat.id, claim.part.index, active_token, "sent", message_id=700
+        )
+        next_claim = await store.claim_next_publication_part(repeat.id, active_token)
+        assert next_claim.outcome == "claimed" and next_claim.part is not None
+        assert next_claim.part.index == 1
+        await store.finish_publication_part(repeat.id, next_claim.part.index, active_token, outcome)
+        await store.release_publication_claim(repeat.id, active_token)
+
+        reopened = Store(store.path)
+        await reopened.initialize()
+        await reopened.recover_publications_on_startup()
+        FrozenDatetime.current = datetime(2026, 11, 16, 9, tzinfo=UTC)
+        dispatcher = create_dispatcher(make_settings(reopened.path), reopened)
+        try:
+            await dispatcher.feed_update(
+                bot,
+                Update(update_id=2, message=private_message(bot, 60, "/publish 09.11.2026")),
+            )
+            recovered = await reopened.get_publication(repeat.id)
+            assert recovered is not None and recovered.id == repeat.id
+            assert recovered.status == ("unknown" if outcome == "unknown" else "partial")
+            recovery_messages = [
+                request
+                for request in session.requests
+                if isinstance(request, SendMessage)
+                and request.chat_id == OWNER_ID
+                and request.reply_markup is not None
+                and any(
+                    button.callback_data is not None
+                    and button.callback_data.startswith(
+                        "pub:resolve:" if outcome == "unknown" else "pub:retry:"
+                    )
+                    for row in request.reply_markup.inline_keyboard
+                    for button in row
+                )
+            ]
+            assert len(recovery_messages) == 1
+            status_message = recovery_messages[0]
+            assert status_message.reply_markup is not None
+            assert recovered.owner_message_id == _message_id(session, status_message)
+            assert "Повтор актуального выпуска" in status_message.text
+            recovery_button = next(
+                button
+                for row in status_message.reply_markup.inline_keyboard
+                for button in row
+                if button.callback_data is not None
+                and button.callback_data.startswith(
+                    "pub:resolve:" if outcome == "unknown" else "pub:retry:"
+                )
+            )
+            assert recovery_button.callback_data is not None
+            await dispatcher.feed_update(
+                bot,
+                _callback_update(
+                    bot,
+                    message_id=_message_id(session, status_message),
+                    callback_data=recovery_button.callback_data,
+                ),
+            )
+
+            continue_message = next(
+                request
+                for request in reversed(session.requests)
+                if isinstance(request, SendMessage)
+                and request.chat_id == OWNER_ID
+                and request.reply_markup is not None
+                and any(
+                    button.callback_data is not None
+                    and button.callback_data.startswith("pub:continue:")
+                    for row in request.reply_markup.inline_keyboard
+                    for button in row
+                )
+            )
+            continue_button = next(
+                button
+                for row in continue_message.reply_markup.inline_keyboard
+                for button in row
+                if button.callback_data is not None
+                and button.callback_data.startswith("pub:continue:")
+            )
+            assert continue_button.callback_data is not None
+            await dispatcher.feed_update(
+                bot,
+                _callback_update(
+                    bot,
+                    message_id=_message_id(session, continue_message),
+                    callback_data=continue_button.callback_data,
+                ),
+            )
+
+            completed = await reopened.get_publication(repeat.id)
+            original_after = await reopened.get_publication(original.id)
+            assert completed is not None and completed.status == "delivered"
+            assert completed.parts[0].status == "sent"
+            assert completed.parts[0].message_id == 700
+            assert original_after is not None and original_after.parts == original_parts
+            group_sends = sum(
+                isinstance(request, SendMessage | SendPhoto) and request.chat_id == GROUP_ID
+                for request in session.requests
+            )
+            repeat_sends = len(completed.parts) - (2 if outcome == "unknown" else 1)
+            assert group_sends == len(post.parts) + repeat_sends
+        finally:
+            await bot.session.close()
+
+    asyncio.run(scenario())

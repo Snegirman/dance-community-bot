@@ -265,6 +265,10 @@ async def publish_command_handler(
 
     existing = await store.get_publication_for_week(settings.telegram_group_id, week_start)
     if existing is not None and existing.status != "prepared":
+        if existing.status == "delivered":
+            pending = await store.get_pending_republication(existing.id)
+            if pending is not None and pending.status != "prepared":
+                existing = pending
         await _send_bound_status(message, store, existing)
         return
     await _prepare_preview(message, store, settings.telegram_group_id, week_start)
