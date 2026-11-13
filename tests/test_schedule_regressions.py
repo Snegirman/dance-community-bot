@@ -500,7 +500,7 @@ def test_repeated_detach_after_reopen_preserves_both_histories(tmp_path: Path) -
             history_count = connection.execute(
                 "SELECT COUNT(*) FROM schedule_exception_history"
             ).fetchone()
-            assert version == (7,)
+            assert version == (8,)
         assert links == [
             (
                 first_event.id,

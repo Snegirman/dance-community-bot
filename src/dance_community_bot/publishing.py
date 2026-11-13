@@ -323,7 +323,11 @@ async def publish_week(
     confirmation: PublicationConfirmation | None = None,
 ) -> PublicationResult:
     """Проверить целевую группу, атомарно захватить выпуск и отправить его части."""
-    existing = await store.get_publication_for_week(group_id, post.week_start)
+    existing = (
+        await store.get_publication(confirmation.publication_id)
+        if confirmation is not None
+        else await store.get_publication_for_week(group_id, post.week_start)
+    )
     if existing is not None and existing.status != "prepared":
         return _stored_result(existing)
     if not await _valid_target(bot, group_id):

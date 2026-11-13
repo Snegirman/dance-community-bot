@@ -54,15 +54,15 @@ class StorageBase:
             schema_version = row[0]
             if not isinstance(schema_version, int):
                 raise RuntimeError("Некорректная версия схемы базы данных.")
-            if schema_version not in (0, 7):
+            if schema_version not in (0, 8):
                 raise RuntimeError(
-                    f"Неподдерживаемая версия схемы базы данных: {schema_version}. Ожидается 7."
+                    f"Неподдерживаемая версия схемы базы данных: {schema_version}. Ожидается 8."
                 )
             if schema_version == 0:
                 for statement in schema.split(";"):
                     if statement.strip():
                         connection.execute(statement)
-                connection.execute("PRAGMA user_version = 7")
+                connection.execute("PRAGMA user_version = 8")
 
     @staticmethod
     def _day_after(value: date | None) -> date | None:

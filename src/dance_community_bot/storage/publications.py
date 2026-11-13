@@ -39,6 +39,63 @@ class PublicationsStorage(SnapshotsStorage):
             owner_message_id,
         )
 
+    async def prepare_republication(
+        self,
+        post: WeeklyPost,
+        group_id: int,
+        source_publication_id: int,
+        request_chat_id: int,
+        request_message_id: int,
+    ) -> PublicationPreviewResult:
+        return await asyncio.to_thread(
+            self._prepare_republication_sync,
+            post,
+            group_id,
+            source_publication_id,
+            request_chat_id,
+            request_message_id,
+        )
+
+    async def refresh_republication(
+        self,
+        post: WeeklyPost,
+        publication_id: int,
+        expected_preview_revision: int,
+    ) -> PublicationPreviewResult:
+        return await asyncio.to_thread(
+            self._refresh_republication_sync,
+            post,
+            publication_id,
+            expected_preview_revision,
+        )
+
+    async def get_republication_for_request(
+        self, request_chat_id: int, request_message_id: int
+    ) -> PublicationState | None:
+        return await asyncio.to_thread(
+            self._get_republication_for_request_sync,
+            request_chat_id,
+            request_message_id,
+        )
+
+    async def get_pending_republication(
+        self, source_publication_id: int
+    ) -> PublicationState | None:
+        return await asyncio.to_thread(self._get_pending_republication_sync, source_publication_id)
+
+    async def bind_republication_request(
+        self,
+        publication_id: int,
+        request_chat_id: int,
+        request_message_id: int,
+    ) -> PublicationState | None:
+        return await asyncio.to_thread(
+            self._bind_republication_request_sync,
+            publication_id,
+            request_chat_id,
+            request_message_id,
+        )
+
     async def get_publication(self, publication_id: int) -> PublicationState | None:
         return await asyncio.to_thread(self._get_publication_sync, publication_id)
 
@@ -230,6 +287,7 @@ class PublicationsStorage(SnapshotsStorage):
         ).fetchall()
         return PublicationState(
             id=row["id"],
+            source_publication_id=row["source_publication_id"],
             group_id=row["group_id"],
             week_start=date.fromisoformat(row["week_start"]),
             catalog_revision=row["catalog_revision"],
@@ -274,7 +332,8 @@ class PublicationsStorage(SnapshotsStorage):
             if self._catalog_revision_from_connection(connection) != post.catalog_revision:
                 return PublicationPreviewResult(outcome="stale", publication=None)
             row = connection.execute(
-                "SELECT * FROM publications WHERE group_id = ? AND week_start = ?",
+                "SELECT * FROM publications WHERE group_id = ? AND week_start = ? "
+                "AND source_publication_id IS NULL",
                 (group_id, post.week_start.isoformat()),
             ).fetchone()
             if row is not None and (row["status"] != "prepared" or row["active_token"] is not None):
@@ -324,10 +383,222 @@ class PublicationsStorage(SnapshotsStorage):
     ) -> PublicationState | None:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM publications WHERE group_id = ? AND week_start = ?",
+                "SELECT * FROM publications WHERE group_id = ? AND week_start = ? "
+                "AND source_publication_id IS NULL",
                 (group_id, week_start.isoformat()),
             ).fetchone()
             return self._publication_from_row(connection, row) if row is not None else None
+
+    @staticmethod
+    def _insert_republication_request(
+        connection: sqlite3.Connection,
+        request_chat_id: int,
+        request_message_id: int,
+        publication_id: int,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO publication_republish_requests "
+            "(request_chat_id, request_message_id, publication_id) VALUES (?, ?, ?)",
+            (request_chat_id, request_message_id, publication_id),
+        )
+
+    def _replace_prepared_republication(
+        self,
+        connection: sqlite3.Connection,
+        publication: PublicationState,
+        post: WeeklyPost,
+    ) -> PublicationState:
+        cursor = connection.execute(
+            "UPDATE publications SET catalog_revision = ?, snapshot_json = ?, "
+            "preview_revision = preview_revision + 1 "
+            "WHERE id = ? AND source_publication_id = ? AND status = 'prepared' "
+            "AND active_token IS NULL",
+            (
+                post.catalog_revision,
+                post.model_dump_json(),
+                publication.id,
+                publication.source_publication_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            current = self._get_publication_by_id(connection, publication.id)
+            if current is None:
+                raise RuntimeError("Не удалось прочитать повторный выпуск.")
+            return current
+        connection.execute(
+            "DELETE FROM publication_parts WHERE publication_id = ?", (publication.id,)
+        )
+        self._insert_publication_parts(connection, publication.id, post)
+        updated = self._get_publication_by_id(connection, publication.id)
+        if updated is None:
+            raise RuntimeError("Не удалось прочитать обновлённый повторный выпуск.")
+        return updated
+
+    def _prepare_republication_sync(
+        self,
+        post: WeeklyPost,
+        group_id: int,
+        source_publication_id: int,
+        request_chat_id: int,
+        request_message_id: int,
+    ) -> PublicationPreviewResult:
+        if post.week_start.weekday() != 0 or not post.parts:
+            raise ValueError("Для повтора нужна непустая неделя, начинающаяся в понедельник.")
+        with self._transaction() as connection:
+            if self._catalog_revision_from_connection(connection) != post.catalog_revision:
+                return PublicationPreviewResult(outcome="stale", publication=None)
+            source_row = connection.execute(
+                "SELECT * FROM publications WHERE id = ? AND group_id = ? AND week_start = ? "
+                "AND source_publication_id IS NULL AND status = 'delivered'",
+                (source_publication_id, group_id, post.week_start.isoformat()),
+            ).fetchone()
+            if source_row is None:
+                return PublicationPreviewResult(outcome="missing", publication=None)
+
+            request_row = connection.execute(
+                "SELECT publication_id FROM publication_republish_requests "
+                "WHERE request_chat_id = ? AND request_message_id = ?",
+                (request_chat_id, request_message_id),
+            ).fetchone()
+            if request_row is not None:
+                publication_row = connection.execute(
+                    "SELECT * FROM publications WHERE id = ?",
+                    (request_row["publication_id"],),
+                ).fetchone()
+                if publication_row is None:
+                    raise RuntimeError("Не удалось прочитать привязанный повторный выпуск.")
+                publication = self._publication_from_row(connection, publication_row)
+                if (
+                    publication.source_publication_id == source_publication_id
+                    and publication.status == "prepared"
+                    and publication.catalog_revision != post.catalog_revision
+                ):
+                    publication = self._replace_prepared_republication(
+                        connection, publication, post
+                    )
+                return PublicationPreviewResult(outcome="existing", publication=publication)
+
+            pending_row = connection.execute(
+                "SELECT * FROM publications WHERE source_publication_id = ? "
+                "AND status <> 'delivered' ORDER BY id DESC LIMIT 1",
+                (source_publication_id,),
+            ).fetchone()
+            if pending_row is not None:
+                publication = self._publication_from_row(connection, pending_row)
+                if (
+                    publication.status == "prepared"
+                    and publication.catalog_revision != post.catalog_revision
+                ):
+                    publication = self._replace_prepared_republication(
+                        connection, publication, post
+                    )
+                self._insert_republication_request(
+                    connection, request_chat_id, request_message_id, publication.id
+                )
+                return PublicationPreviewResult(outcome="existing", publication=publication)
+
+            cursor = connection.execute(
+                "INSERT INTO publications "
+                "(source_publication_id, group_id, week_start, catalog_revision, snapshot_json, "
+                "status, preview_revision) VALUES (?, ?, ?, ?, ?, 'prepared', 1)",
+                (
+                    source_publication_id,
+                    group_id,
+                    post.week_start.isoformat(),
+                    post.catalog_revision,
+                    post.model_dump_json(),
+                ),
+            )
+            publication_id = cursor.lastrowid
+            if not isinstance(publication_id, int):
+                raise RuntimeError("Не удалось сохранить повторный выпуск.")
+            self._insert_publication_parts(connection, publication_id, post)
+            self._insert_republication_request(
+                connection, request_chat_id, request_message_id, publication_id
+            )
+            publication = self._get_publication_by_id(connection, publication_id)
+            if publication is None:
+                raise RuntimeError("Не удалось прочитать подготовленный повторный выпуск.")
+            return PublicationPreviewResult(outcome="ready", publication=publication)
+
+    def _refresh_republication_sync(
+        self,
+        post: WeeklyPost,
+        publication_id: int,
+        expected_preview_revision: int,
+    ) -> PublicationPreviewResult:
+        if post.week_start.weekday() != 0 or not post.parts:
+            raise ValueError("Для повтора нужна непустая неделя, начинающаяся в понедельник.")
+        with self._transaction() as connection:
+            if self._catalog_revision_from_connection(connection) != post.catalog_revision:
+                return PublicationPreviewResult(outcome="stale", publication=None)
+            row = connection.execute(
+                "SELECT * FROM publications WHERE id = ? AND source_publication_id IS NOT NULL",
+                (publication_id,),
+            ).fetchone()
+            if row is None:
+                return PublicationPreviewResult(outcome="missing", publication=None)
+            publication = self._publication_from_row(connection, row)
+            if (
+                publication.status != "prepared"
+                or publication.active_token is not None
+                or publication.preview_revision != expected_preview_revision
+                or publication.week_start != post.week_start
+            ):
+                return PublicationPreviewResult(outcome="existing", publication=publication)
+            if publication.catalog_revision == post.catalog_revision:
+                return PublicationPreviewResult(outcome="existing", publication=publication)
+            updated = self._replace_prepared_republication(connection, publication, post)
+            return PublicationPreviewResult(outcome="ready", publication=updated)
+
+    def _get_republication_for_request_sync(
+        self, request_chat_id: int, request_message_id: int
+    ) -> PublicationState | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT publication_id FROM publication_republish_requests "
+                "WHERE request_chat_id = ? AND request_message_id = ?",
+                (request_chat_id, request_message_id),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._get_publication_by_id(connection, row["publication_id"])
+
+    def _get_pending_republication_sync(
+        self, source_publication_id: int
+    ) -> PublicationState | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM publications WHERE source_publication_id = ? "
+                "AND status <> 'delivered' ORDER BY id DESC LIMIT 1",
+                (source_publication_id,),
+            ).fetchone()
+            return self._publication_from_row(connection, row) if row is not None else None
+
+    def _bind_republication_request_sync(
+        self,
+        publication_id: int,
+        request_chat_id: int,
+        request_message_id: int,
+    ) -> PublicationState | None:
+        with self._transaction() as connection:
+            mapping = connection.execute(
+                "SELECT publication_id FROM publication_republish_requests "
+                "WHERE request_chat_id = ? AND request_message_id = ?",
+                (request_chat_id, request_message_id),
+            ).fetchone()
+            if mapping is not None:
+                return self._get_publication_by_id(connection, mapping["publication_id"])
+            row = connection.execute(
+                "SELECT * FROM publications WHERE id = ? AND source_publication_id IS NOT NULL",
+                (publication_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            self._insert_republication_request(
+                connection, request_chat_id, request_message_id, publication_id
+            )
+            return self._publication_from_row(connection, row)
 
     def _bind_publication_message_sync(
         self,
@@ -363,10 +634,16 @@ class PublicationsStorage(SnapshotsStorage):
         with self._transaction() as connection:
             if self._catalog_revision_from_connection(connection) != post.catalog_revision:
                 return PublicationClaimResult(outcome="stale", publication=None, part=None)
-            row = connection.execute(
-                "SELECT * FROM publications WHERE group_id = ? AND week_start = ?",
-                (group_id, post.week_start.isoformat()),
-            ).fetchone()
+            if expected_publication_id is None:
+                row = connection.execute(
+                    "SELECT * FROM publications WHERE group_id = ? AND week_start = ? "
+                    "AND source_publication_id IS NULL",
+                    (group_id, post.week_start.isoformat()),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT * FROM publications WHERE id = ?", (expected_publication_id,)
+                ).fetchone()
 
             if row is None:
                 if expected_publication_id is not None:
@@ -383,6 +660,8 @@ class PublicationsStorage(SnapshotsStorage):
                 ).fetchone()
             elif expected_publication_id is not None and (
                 row["id"] != expected_publication_id
+                or row["group_id"] != group_id
+                or row["week_start"] != post.week_start.isoformat()
                 or row["preview_revision"] != expected_preview_revision
                 or row["owner_chat_id"] != owner_chat_id
                 or row["owner_message_id"] != owner_message_id

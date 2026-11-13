@@ -179,6 +179,7 @@ CREATE TABLE detached_occurrence_links (
 
 CREATE TABLE publications (
     id INTEGER PRIMARY KEY,
+    source_publication_id INTEGER REFERENCES publications(id) ON DELETE RESTRICT,
     group_id INTEGER NOT NULL,
     week_start TEXT NOT NULL,
     catalog_revision TEXT NOT NULL,
@@ -191,8 +192,22 @@ CREATE TABLE publications (
     notified_revision INTEGER NOT NULL DEFAULT 0 CHECK (notified_revision >= 0),
     owner_chat_id INTEGER,
     owner_message_id INTEGER,
-    active_token TEXT,
-    UNIQUE (group_id, week_start)
+    active_token TEXT
+);
+
+CREATE UNIQUE INDEX publications_original_by_week
+    ON publications (group_id, week_start)
+    WHERE source_publication_id IS NULL;
+
+CREATE UNIQUE INDEX publications_pending_repeat_by_source
+    ON publications (source_publication_id)
+    WHERE source_publication_id IS NOT NULL AND status <> 'delivered';
+
+CREATE TABLE publication_republish_requests (
+    request_chat_id INTEGER NOT NULL,
+    request_message_id INTEGER NOT NULL,
+    publication_id INTEGER NOT NULL REFERENCES publications(id) ON DELETE CASCADE,
+    PRIMARY KEY (request_chat_id, request_message_id)
 );
 
 CREATE TABLE publication_parts (

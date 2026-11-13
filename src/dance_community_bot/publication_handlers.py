@@ -90,8 +90,11 @@ def _publication_text(publication: PublicationState) -> str:
         "unknown": "доставка неизвестна",
         "delivered": "доставлен",
     }
+    title = (
+        "Повтор актуального выпуска" if publication.source_publication_id is not None else "Выпуск"
+    )
     lines = [
-        f"Выпуск недели с {publication.week_start:%d.%m.%Y}: "
+        f"{title} недели с {publication.week_start:%d.%m.%Y}: "
         f"{publication_statuses[publication.status]}.",
         f"Группа: {publication.group_id}.",
         "Части: "
@@ -102,14 +105,24 @@ def _publication_text(publication: PublicationState) -> str:
         ),
     ]
     if publication.status == "prepared":
-        lines[0] = f"Предпросмотр недели с {publication.week_start:%d.%m.%Y}. Опубликовать?"
+        if publication.source_publication_id is not None:
+            lines[0] = (
+                f"Актуальный предпросмотр недели с {publication.week_start:%d.%m.%Y}. "
+                "Подтвердить повторную отправку?"
+            )
+            lines.append(
+                "Если каталог изменится до отправки, предпросмотр обновится и потребуется "
+                "новое подтверждение."
+            )
+        else:
+            lines[0] = f"Предпросмотр недели с {publication.week_start:%d.%m.%Y}. Опубликовать?"
     elif publication.status == "unknown":
         lines.append(
             "Проверьте группу перед выбором: возможна доставка части. "
             "Повтор может создать дубль. Будет повторена только выбранная часть."
         )
     elif publication.status == "delivered":
-        lines.append("Повторная отправка не выполняется.")
+        lines.append("Для нового повтора текущей недели используйте /republish.")
     return "\n".join(lines)
 
 
@@ -121,8 +134,16 @@ def _publication_keyboard(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="Опубликовать",
-                    callback_data=f"pub:confirm:{publication.id}:{preview_revision}",
+                    text=(
+                        "Повторить актуальный выпуск"
+                        if publication.source_publication_id is not None
+                        else "Опубликовать"
+                    ),
+                    callback_data=(
+                        f"pub:republish:{publication.id}:{preview_revision}"
+                        if publication.source_publication_id is not None
+                        else f"pub:confirm:{publication.id}:{preview_revision}"
+                    ),
                 )
             ]
         )
@@ -249,6 +270,105 @@ async def publish_command_handler(
     await _prepare_preview(message, store, settings.telegram_group_id, week_start)
 
 
+async def _prepare_republication_preview(
+    target: Message,
+    store: Store,
+    original: PublicationState,
+    post: WeeklyPost,
+) -> None:
+    for _attempt in range(3):
+        result = await store.prepare_republication(
+            post,
+            original.group_id,
+            original.id,
+            target.chat.id,
+            target.message_id,
+        )
+        if result.outcome == "stale":
+            post = await build_weekly_post(post.week_start, store)
+            if not post.records and not post.occurrences:
+                await target.answer("На эту неделю записей нет. Повтор не подготовлен.")
+                return
+            continue
+        if result.outcome == "missing":
+            await target.answer(
+                "Нет полностью доставленного выпуска за эту неделю. Сначала выполните /publish."
+            )
+            return
+        publication = result.publication
+        if publication is None:
+            await target.answer("Не удалось подготовить повтор. Повторите /republish позже.")
+            return
+        if publication.status == "prepared" and not await _send_preview(
+            target, publication.snapshot, store
+        ):
+            return
+        await _send_bound_status(target, store, publication)
+        return
+    await target.answer("Данные меняются во время предпросмотра. Повторите /republish позже.")
+
+
+async def republish_command_handler(
+    message: Message,
+    store: Store,
+    settings: Settings,
+) -> None:
+    """Подготовить актуальный снимок недели для повторной отправки."""
+    command_parts = (message.text or "").split(maxsplit=1)
+    if len(command_parts) == 2 and command_parts[1].strip():
+        await message.answer("Команда /republish не принимает дату.")
+        return
+
+    bound = await store.get_republication_for_request(message.chat.id, message.message_id)
+    current_week = week_bounds(datetime.now(_MOSCOW).date())[0].date()
+    if bound is not None:
+        if (
+            bound.status != "prepared"
+            or bound.week_start != current_week
+            or settings.telegram_group_id != bound.group_id
+            or bound.source_publication_id is None
+        ):
+            await _send_bound_status(message, store, bound)
+            return
+        post = await build_weekly_post(bound.week_start, store)
+        if not post.records and not post.occurrences:
+            await message.answer("На эту неделю записей нет. Повтор не подготовлен.")
+            return
+        original = await store.get_publication(bound.source_publication_id)
+        if original is None:
+            await message.answer("Исходный выпуск недоступен. Повторите /publish.")
+            return
+        await _prepare_republication_preview(message, store, original, post)
+        return
+
+    if settings.telegram_group_id is None:
+        await message.answer("Для публикации настройте TELEGRAM_GROUP_ID группы или супергруппы.")
+        return
+    original = await store.get_publication_for_week(settings.telegram_group_id, current_week)
+    if original is None or original.status != "delivered":
+        await message.answer(
+            "Нет полностью доставленного выпуска за текущую неделю. Сначала выполните /publish."
+        )
+        return
+
+    pending = await store.get_pending_republication(original.id)
+    if pending is not None and pending.status != "prepared":
+        attached = await store.bind_republication_request(
+            pending.id, message.chat.id, message.message_id
+        )
+        if attached is not None:
+            await _send_bound_status(message, store, attached)
+        return
+
+    post = await build_weekly_post(current_week, store)
+    if not post.records and not post.occurrences:
+        if pending is not None:
+            await store.bind_republication_request(pending.id, message.chat.id, message.message_id)
+        await message.answer("На эту неделю записей нет. Повтор не подготовлен.")
+        return
+    await _prepare_republication_preview(message, store, original, post)
+
+
 def _parse_callback(data: str) -> tuple[str, tuple[int, ...]] | None:
     if len(data.encode("utf-8")) > 64:
         return None
@@ -283,6 +403,34 @@ async def _refresh_callback_status(
     await _send_bound_status(message, store, publication)
 
 
+async def _refresh_republication_callback(
+    target: Message,
+    store: Store,
+    publication: PublicationState,
+) -> None:
+    for _ in range(3):
+        post = await build_weekly_post(publication.week_start, store)
+        if not post.records and not post.occurrences:
+            await target.answer("На эту неделю записей нет. Повторная отправка не началась.")
+            return
+        result = await store.refresh_republication(
+            post, publication.id, publication.preview_revision
+        )
+        if result.outcome == "stale":
+            continue
+        updated = result.publication
+        if updated is None:
+            await target.answer("Не удалось обновить повторный выпуск. Откройте /republish.")
+            return
+        if updated.status == "prepared" and not await _send_preview(
+            target, updated.snapshot, store
+        ):
+            return
+        await _send_bound_status(target, store, updated)
+        return
+    await target.answer("Данные меняются. Повторите /republish и подтвердите новый предпросмотр.")
+
+
 async def publication_callback_handler(
     callback: CallbackQuery,
     store: Store,
@@ -301,7 +449,7 @@ async def publication_callback_handler(
         await _answer_stale(callback)
         return
     action, values = parsed
-    if action == "confirm" and len(values) == 2:
+    if action in ("confirm", "republish") and len(values) == 2:
         publication_id, preview_revision = values
         publication = await store.get_publication(publication_id)
     elif action in ("resolve", "retry") and len(values) == (5 if action == "resolve" else 4):
@@ -324,13 +472,18 @@ async def publication_callback_handler(
     ):
         await _answer_stale(callback)
         return
+    if action in ("confirm", "republish") and (
+        (action == "republish") != (publication.source_publication_id is not None)
+    ):
+        await _answer_stale(callback)
+        return
 
     await callback.answer()
     owner_chat_id = message.chat.id
     owner_message_id = message.message_id
     result: PublicationResult | None = None
     try:
-        if action == "confirm":
+        if action in ("confirm", "republish"):
             if publication.status != "prepared":
                 await _answer_stale(callback)
                 return
@@ -401,12 +554,16 @@ async def publication_callback_handler(
 
     updated = await store.get_publication(publication_id)
     if result is not None and result.status == "stale":
+        if publication.source_publication_id is not None:
+            await _refresh_republication_callback(message, store, publication)
+            return
         await message.answer("Данные изменились после предпросмотра. Проверьте новый выпуск.")
         await _prepare_preview(message, store, publication.group_id, publication.week_start)
         return
     if result is not None and result.status == "rejected":
+        command = "/republish" if publication.source_publication_id is not None else "/publish"
         await message.answer(
             "Отправка не началась. Проверьте TELEGRAM_GROUP_ID, доступ бота к группе "
-            "или супергруппе и откройте актуальные кнопки через /publish."
+            f"или супергруппе и откройте актуальные кнопки через {command}."
         )
     await _refresh_callback_status(callback, store, updated)

@@ -14,6 +14,7 @@ from dance_community_bot.intake import handle_card_action, ingest_message
 from dance_community_bot.publication_handlers import (
     publication_callback_handler,
     publish_command_handler,
+    republish_command_handler,
 )
 from dance_community_bot.schedule_handlers import schedule_command_handler
 from dance_community_bot.scheduler import run_scheduler
@@ -36,6 +37,7 @@ HELP_TEXT = (
     "/schedule [ДД.ММ.ГГГГ] — расписание недели и изменения серий\n"
     "/preview [ДД.ММ.ГГГГ] — предпросмотр публикации за неделю\n"
     "/publish [ДД.ММ.ГГГГ] — предпросмотр и ручная публикация недели\n"
+    "/republish — повторить актуальный выпуск текущей недели\n"
     "/settings — время автопубликации\n"
     "/status — настройки и состояние публикаций\n"
     "/help — эта справка"
@@ -203,6 +205,7 @@ def create_dispatcher(settings: Settings, store: Store) -> Dispatcher:
     dispatcher.message.register(schedule_handler, Command("schedule"))
     dispatcher.message.register(preview_handler, Command("preview"))
     dispatcher.message.register(publish_command_handler, Command("publish"))
+    dispatcher.message.register(republish_command_handler, Command("republish"))
     dispatcher.message.register(settings_command_handler, Command("settings"))
     dispatcher.message.register(status_handler, Command("status"))
     dispatcher.message.register(intake_handler)

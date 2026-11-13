@@ -390,6 +390,7 @@ class PublicationState(BaseModel):
     notification_revision: int = 0
     notified_revision: int = 0
     parts: tuple[PublicationPartState, ...]
+    source_publication_id: int | None = None
 
 
 class PublicationChangeNotification(BaseModel):
@@ -422,7 +423,7 @@ class AutomationStatus(BaseModel):
 class PublicationPreviewResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    outcome: Literal["ready", "stale", "existing"]
+    outcome: Literal["ready", "stale", "existing", "missing"]
     publication: PublicationState | None
 
 
