@@ -23,6 +23,7 @@ from ..models import (
     SeriesVersion,
     TransferOccurrence,
 )
+from .automation import capture_weekly_snapshot, mark_published_week_changes
 from .base import StorageBase
 
 _SCHEDULE_CHANGE_ADAPTER = TypeAdapter(ScheduleChange)
@@ -290,6 +291,7 @@ class ScheduleStorage(StorageBase):
                 ):
                     raise ValueError("Афиша новой версии ещё не сохранена полностью.")
 
+            before_snapshot = capture_weekly_snapshot(connection)
             if isinstance(change, OccurrenceChange):
                 if change.expected_exception_revision != row["base_exception_revision"]:
                     raise ValueError("Снимок исключения в изменении повреждён.")
@@ -341,6 +343,9 @@ class ScheduleStorage(StorageBase):
                 "UPDATE schedule_change_drafts SET status = 'confirmed' "
                 "WHERE id = ? AND version = ? AND status = 'pending'",
                 (draft_id, version),
+            )
+            mark_published_week_changes(
+                connection, before_snapshot, capture_weekly_snapshot(connection)
             )
 
     def _discard_schedule_change_sync(self, draft_id: int, version: int) -> None:

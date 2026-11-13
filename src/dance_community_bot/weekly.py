@@ -176,12 +176,17 @@ def _section_parts(
     return parts
 
 
-async def build_weekly_post(week_start: date, store: Store) -> WeeklyPost:
-    """Собрать сериализуемый выпуск из одного согласованного снимка Store."""
+def build_weekly_post_from_snapshot(
+    week_start: date,
+    records: list[Record],
+    versions: list[SeriesVersion],
+    exceptions: list[ScheduleException],
+    poster_paths: dict[int, Path | None],
+) -> WeeklyPost:
+    """Собрать выпуск из переданного согласованного снимка данных."""
     if week_start.weekday() != 0:
         raise ValueError("Неделя должна начинаться в понедельник.")
     start, end = week_bounds(week_start)
-    records, versions, exceptions, poster_paths = await store.get_weekly_snapshot()
     catalog_revision = _catalog_revision(records, versions, exceptions, poster_paths)
 
     week_last = date.fromordinal(end.date().toordinal() - 1)
@@ -247,6 +252,12 @@ async def build_weekly_post(week_start: date, store: Store) -> WeeklyPost:
         records=tuple(record for record, _ in events),
         occurrences=tuple(occurrences),
     )
+
+
+async def build_weekly_post(week_start: date, store: Store) -> WeeklyPost:
+    """Собрать сериализуемый выпуск из одного согласованного снимка Store."""
+    snapshot = await store.get_weekly_snapshot()
+    return build_weekly_post_from_snapshot(week_start, *snapshot)
 
 
 async def preview_command_handler(message: Message, store: Store) -> None:

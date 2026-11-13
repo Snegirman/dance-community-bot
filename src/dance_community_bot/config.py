@@ -1,6 +1,7 @@
 """Загрузка и проверка обязательных настроек Telegram-бота."""
 
 import re
+from datetime import time
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -22,12 +23,27 @@ class Settings(BaseSettings):
     webhook_port: int = 8080
     database_path: Path = Path("data/dance-community-bot.sqlite3")
     telegram_group_id: int | None = Field(default=None, gt=-(2**52), lt=0)
+    weekly_publication_time: time | None = None
 
     @field_validator("telegram_group_id", mode="before")
     @classmethod
     def normalize_telegram_group_id(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
             return None
+        return value
+
+    @field_validator("weekly_publication_time", mode="before")
+    @classmethod
+    def normalize_weekly_publication_time(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip()
+            if not normalized:
+                return None
+            if re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", normalized) is None:
+                raise ValueError("Время автопубликации должно быть в формате ЧЧ:ММ.")
+            return normalized
+        if isinstance(value, time) and value.utcoffset() is not None:
+            raise ValueError("Для автопубликации нельзя задавать часовой пояс.")
         return value
 
     @field_validator("telegram_bot_token")
@@ -99,5 +115,5 @@ def load_settings() -> Settings:
         raise SettingsError(
             "Ошибка настроек: проверьте TELEGRAM_BOT_TOKEN, TELEGRAM_OWNER_ID, "
             "TELEGRAM_WEBHOOK_URL, TELEGRAM_WEBHOOK_SECRET, WEBHOOK_PORT "
-            "и TELEGRAM_GROUP_ID."
+            "TELEGRAM_GROUP_ID и WEEKLY_PUBLICATION_TIME."
         ) from None

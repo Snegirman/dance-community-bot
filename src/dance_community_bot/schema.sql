@@ -187,6 +187,8 @@ CREATE TABLE publications (
         status IN ('prepared', 'sending', 'partial', 'unknown', 'delivered')
     ),
     preview_revision INTEGER NOT NULL CHECK (preview_revision > 0),
+    notification_revision INTEGER NOT NULL DEFAULT 0 CHECK (notification_revision >= 0),
+    notified_revision INTEGER NOT NULL DEFAULT 0 CHECK (notified_revision >= 0),
     owner_chat_id INTEGER,
     owner_message_id INTEGER,
     active_token TEXT,
@@ -207,3 +209,44 @@ CREATE TABLE publication_parts (
 
 CREATE INDEX publication_parts_by_status
     ON publication_parts (publication_id, status, part_index);
+
+CREATE TABLE publication_notifications (
+    publication_id INTEGER NOT NULL REFERENCES publications(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    message_text TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'sending', 'sent')),
+    PRIMARY KEY (publication_id, revision)
+);
+
+CREATE INDEX publication_notifications_by_status
+    ON publication_notifications (status, publication_id, revision);
+
+CREATE TABLE scheduler_notices (
+    week_start TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('empty', 'missed')),
+    setting_revision INTEGER NOT NULL DEFAULT 0 CHECK (setting_revision >= 0),
+    message_text TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'sending', 'sent')),
+    PRIMARY KEY (week_start, kind, setting_revision)
+);
+
+CREATE INDEX scheduler_notices_by_status
+    ON scheduler_notices (status, week_start);
+
+CREATE TABLE weekly_publication_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    publication_time TEXT,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    changed_at TEXT
+);
+
+CREATE TABLE weekly_publication_prompts (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'consumed', 'superseded')),
+    PRIMARY KEY (chat_id, message_id)
+);
+
+CREATE INDEX weekly_publication_prompts_by_status
+    ON weekly_publication_prompts (chat_id, status, revision);

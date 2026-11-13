@@ -375,8 +375,37 @@ def test_help_only_lists_implemented_input_routes(
     feed(dispatcher, bot, make_message_update(update_id=21, text="/help"))
 
     text = "\n".join(message_texts(session))
-    assert all(command in text for command in ("/event", "/class", "/events", "/publish"))
+    assert all(
+        command in text for command in ("/event", "/class", "/events", "/publish", "/status")
+    )
     assert "ещё не реализ" not in text.lower()
+
+
+def test_status_reports_automation_settings_and_incomplete_attachments(
+    client: tuple[Bot, RecordingSession], app: tuple[Dispatcher, Store]
+) -> None:
+    bot, session = client
+    dispatcher, store = app
+
+    async def save_incomplete_attachment() -> None:
+        await store.save_source(
+            SourceInput(
+                chat_id=OWNER_ID,
+                message_id=100,
+                text="Афиша",
+                received_at=datetime(2026, 11, 12, 10, tzinfo=UTC),
+                telegram_file_id="telegram-file-id",
+                is_photo=True,
+            )
+        )
+
+    asyncio.run(save_incomplete_attachment())
+    feed(dispatcher, bot, make_message_update(update_id=101, text="/status"))
+
+    text = "\n".join(message_texts(session))
+    assert "Автопубликация: выключена" in text
+    assert "Незавершённые вложения: 1" in text
+    assert "неизвестная доставка" in text.casefold()
 
 
 def test_owner_malformed_material_is_saved_without_creating_catalog_record(
@@ -405,7 +434,15 @@ def test_owner_malformed_material_is_saved_without_creating_catalog_record(
 )
 @pytest.mark.parametrize(
     "text",
-    ["материал", "/help", "/start", "/schedule 09.11.2026", "/preview", "/publish"],
+    [
+        "материал",
+        "/help",
+        "/start",
+        "/schedule 09.11.2026",
+        "/preview",
+        "/publish",
+        "/status",
+    ],
 )
 def test_disallowed_messages_are_ignored(
     client: tuple[Bot, RecordingSession],

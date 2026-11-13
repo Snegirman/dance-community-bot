@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, time
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,47 @@ def test_telegram_group_id_can_be_empty_or_a_numeric_target(tmp_path: Path) -> N
 
     assert without_group.telegram_group_id is None
     assert with_group.telegram_group_id == -100123
+
+
+def test_weekly_publication_time_is_optional_and_strict(tmp_path: Path) -> None:
+    shared = {
+        "telegram_bot_token": "123456:dotenvsecret",
+        "telegram_owner_id": 111,
+        "telegram_webhook_url": "https://dance.example.org/telegram/webhook",
+        "telegram_webhook_secret": "dotenv_hook_secret",
+        "database_path": tmp_path / "dance.sqlite3",
+    }
+
+    without_time = Settings(**shared, weekly_publication_time="  ")
+    with_time = Settings(**shared, weekly_publication_time="23:59")
+
+    assert without_time.weekly_publication_time is None
+    assert with_time.weekly_publication_time == time(23, 59)
+
+
+@pytest.mark.parametrize("value", ["9:00", "24:00", "09:60", "tomorrow", "09:00+03:00"])
+def test_weekly_publication_time_rejects_values_outside_hh_mm(tmp_path: Path, value: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            telegram_bot_token="123456:dotenvsecret",
+            telegram_owner_id=111,
+            telegram_webhook_url="https://dance.example.org/telegram/webhook",
+            telegram_webhook_secret="dotenv_hook_secret",
+            database_path=tmp_path / "dance.sqlite3",
+            weekly_publication_time=value,
+        )
+
+
+def test_weekly_publication_time_rejects_timezone_aware_time(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            telegram_bot_token="123456:dotenvsecret",
+            telegram_owner_id=111,
+            telegram_webhook_url="https://dance.example.org/telegram/webhook",
+            telegram_webhook_secret="dotenv_hook_secret",
+            database_path=tmp_path / "dance.sqlite3",
+            weekly_publication_time=time(9, tzinfo=UTC),
+        )
 
 
 @pytest.mark.parametrize("group_id", [0, 1, -(2**52), 2**52])

@@ -9,8 +9,10 @@ import pytest
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiohttp import web
+from telegram_transport import RecordingSession
 
 from dance_community_bot import __main__ as entrypoint
+from dance_community_bot import bot as bot_module
 from dance_community_bot.config import Settings
 from dance_community_bot.storage import Store
 
@@ -109,6 +111,42 @@ def test_webhook_registration_and_shutdown_close_session(
     delete_webhook.assert_not_awaited()
     assert lifecycle == ["startup", "shutdown"]
     assert session.closed
+
+
+def test_dispatcher_starts_and_stops_one_scheduler_task(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def scenario() -> None:
+        settings = make_settings(tmp_path / "dance.sqlite3")
+        store = Store(settings.database_path)
+        session = RecordingSession(-100123)
+        bot = Bot(token=TOKEN, session=session)
+        dispatcher = entrypoint.create_dispatcher(settings, store)
+        scheduler_started = asyncio.Event()
+        scheduler_stopped = asyncio.Event()
+        starts = 0
+
+        async def run_scheduler(
+            current_settings: Settings, current_store: Store, current_bot: Bot
+        ) -> None:
+            nonlocal starts
+            starts += 1
+            scheduler_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                scheduler_stopped.set()
+
+        monkeypatch.setattr(bot_module, "run_scheduler", run_scheduler)
+        await dispatcher.emit_startup(bot=bot)
+        await asyncio.wait_for(scheduler_started.wait(), timeout=1)
+        assert starts == 1
+
+        await dispatcher.emit_shutdown(bot=bot)
+        await asyncio.wait_for(scheduler_stopped.wait(), timeout=1)
+        await bot.session.close()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("failure_point", ["registration", "startup", "shutdown"])

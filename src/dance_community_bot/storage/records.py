@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 
 from ..models import CardData, ClassData, Draft, Record
+from .automation import capture_weekly_snapshot, mark_published_week_changes
 from .base import StorageBase
 
 
@@ -207,6 +208,7 @@ class RecordsStorage(StorageBase):
             else:
                 raise ValueError("Нельзя подтвердить черновик отменённой записи.")
 
+            before_snapshot = capture_weekly_snapshot(connection)
             update = connection.execute(
                 "UPDATE records SET revision = ?, data_type = ?, data_json = ?, "
                 "poster_source_id = ?, status = 'active' "
@@ -251,6 +253,9 @@ class RecordsStorage(StorageBase):
             ).fetchone()
             if updated_record is None:
                 raise RuntimeError("Подтверждённая запись не найдена.")
+            mark_published_week_changes(
+                connection, before_snapshot, capture_weekly_snapshot(connection)
+            )
             return self._record_from_row(updated_record)
 
     def _reject_draft_sync(self, draft_id: int, version: int) -> None:
@@ -286,6 +291,7 @@ class RecordsStorage(StorageBase):
                 raise ValueError("Регулярное занятие завершайте через управление расписанием.")
             if record["revision"] != revision:
                 raise ValueError("Ревизия записи устарела.")
+            before_snapshot = capture_weekly_snapshot(connection)
             updated = connection.execute(
                 "UPDATE records SET revision = revision + 1, status = 'cancelled' "
                 "WHERE id = ? AND revision = ? AND status = 'active'",
@@ -303,6 +309,9 @@ class RecordsStorage(StorageBase):
             ).fetchone()
             if cancelled is None:
                 raise RuntimeError("Отменённая запись не найдена.")
+            mark_published_week_changes(
+                connection, before_snapshot, capture_weekly_snapshot(connection)
+            )
             return self._record_from_row(cancelled)
 
     def _get_record_sync(self, record_id: int) -> Record | None:

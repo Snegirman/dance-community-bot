@@ -59,12 +59,12 @@ def test_initialize_can_be_repeated_with_existing_data(tmp_path: Path) -> None:
             version_row = connection.execute("PRAGMA user_version").fetchone()
 
         assert restored_source.id == source.id
-        assert version_row == (5,)
+        assert version_row == (7,)
 
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("schema_version", [1, 2, 3, 4, 6])
+@pytest.mark.parametrize("schema_version", [1, 2, 3, 4, 5, 6])
 def test_initialize_rejects_unsupported_versions_without_changing_database(
     tmp_path: Path, schema_version: int
 ) -> None:

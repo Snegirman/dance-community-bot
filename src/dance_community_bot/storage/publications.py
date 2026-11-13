@@ -239,6 +239,8 @@ class PublicationsStorage(SnapshotsStorage):
             owner_chat_id=row["owner_chat_id"],
             owner_message_id=row["owner_message_id"],
             active_token=row["active_token"],
+            notification_revision=row["notification_revision"],
+            notified_revision=row["notified_revision"],
             parts=tuple(
                 PublicationPartState(
                     index=part_row["part_index"],

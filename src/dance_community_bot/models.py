@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -80,6 +80,37 @@ class ClassData(BaseModel):
         if self.last_date is not None and self.last_date < self.first_date:
             raise ValueError("Последняя дата не может быть раньше первой даты.")
         return self
+
+
+class WeeklyPublicationSetting(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    weekly_publication_time: time | None
+    revision: int
+    changed_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_setting(self) -> Self:
+        if self.revision < 0:
+            raise ValueError("Ревизия настройки публикации не может быть отрицательной.")
+        if self.weekly_publication_time is not None and (
+            self.weekly_publication_time.tzinfo is not None
+            or self.weekly_publication_time.second != 0
+            or self.weekly_publication_time.microsecond != 0
+        ):
+            raise ValueError("Время публикации должно быть задано с точностью до минуты.")
+        if self.changed_at is not None and (
+            self.changed_at.tzinfo is None or self.changed_at.utcoffset() is None
+        ):
+            raise ValueError("Дата изменения настройки должна содержать часовой пояс.")
+        return self
+
+
+class WeeklyPublicationPrompt(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    revision: int
+    status: Literal["pending", "consumed", "superseded"]
 
 
 class SeriesVersion(BaseModel):
@@ -356,7 +387,36 @@ class PublicationState(BaseModel):
     owner_chat_id: int | None
     owner_message_id: int | None
     active_token: str | None
+    notification_revision: int = 0
+    notified_revision: int = 0
     parts: tuple[PublicationPartState, ...]
+
+
+class PublicationChangeNotification(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    publication_id: int
+    revision: int
+    text: str
+
+
+class SchedulerNotice(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    week_start: date
+    kind: Literal["empty", "missed"]
+    text: str
+    status: Literal["pending", "sending", "sent"]
+    setting_revision: int = 0
+
+
+class AutomationStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    incomplete_attachments: int
+    publications: dict[str, int]
+    pending_publication_notifications: int
+    pending_scheduler_notices: int
 
 
 class PublicationPreviewResult(BaseModel):
