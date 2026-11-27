@@ -11,7 +11,6 @@ from aiogram.methods import SendMessage
 from aiogram.types import CallbackQuery, Chat, InlineKeyboardMarkup, Message, PhotoSize, User
 from telegram_transport import RecordingSession
 
-from dance_community_bot.cards import show_source
 from dance_community_bot.intake import handle_card_action, ingest_message
 from dance_community_bot.models import (
     CardBinding,
@@ -61,6 +60,47 @@ async def saved_poster_source(store: Store, database: Path, message_id: int, fil
     await asyncio.to_thread(full_path.write_bytes, b"poster")
     await store.set_source_poster_path(source.id, poster_path)
     return source.id
+
+
+def test_schedule_proposal_does_not_process_an_unsaved_poster_source(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "unsaved-poster.sqlite3")
+        series_id = await saved_series(store)
+        record = await store.get_record(series_id)
+        assert record is not None
+        request_source = await store.save_source(
+            SourceInput(chat_id=111, message_id=2, text="change", received_at=NOW)
+        )
+        poster = await store.save_source(
+            SourceInput(
+                chat_id=111,
+                message_id=3,
+                received_at=NOW,
+                telegram_file_id="not-yet-saved",
+                is_photo=True,
+            )
+        )
+
+        await store.propose_schedule_change(
+            ChangeSeries(
+                action="change_series",
+                series_id=series_id,
+                expected_revision=record.revision,
+                effective_from=date(2026, 11, 24),
+                data=ClassData(title="Waving", first_date=date(2026, 11, 24), start_time=time(20)),
+                source_id=request_source.id,
+                poster_source_id=poster.id,
+            ),
+            NOW,
+        )
+
+        unsaved = await store.get_source_by_id(poster.id)
+        assert unsaved is not None
+        assert unsaved.status == "pending"
+        assert unsaved.attachment_status == "pending"
+        assert unsaved.poster_path is None
+
+    asyncio.run(scenario())
 
 
 def test_maximum_last_date_does_not_break_an_ordinary_week() -> None:
@@ -115,10 +155,24 @@ def test_series_can_end_on_a_day_without_an_occurrence(
     asyncio.run(scenario())
 
 
-def test_correcting_saved_schedule_source_keeps_series_and_original_poster(tmp_path: Path) -> None:
+def test_invalid_schedule_edit_keeps_series_and_original_poster(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = Store(tmp_path / "dance.sqlite3")
-        series_id = await saved_series(store)
+        await store.initialize()
+        original_poster_id = await saved_poster_source(
+            store, store.path, 2, "original-schedule-poster.jpg"
+        )
+        series_source = await store.save_source(
+            SourceInput(chat_id=111, message_id=1, text="Занятие", received_at=NOW)
+        )
+        series_draft = await store.save_draft(
+            series_source.id,
+            ClassData(title="Popping", first_date=date(2026, 11, 10), start_time=time(19)),
+            original_poster_id,
+        )
+        record = await store.confirm_draft(series_draft.id, series_draft.version)
+        await store.mark_source_processed(original_poster_id)
+        series_id = record.id
         session = RecordingSession(111)
         bot = Bot(token="987654:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno", session=session)
         await store.bind_card_message(
@@ -132,7 +186,7 @@ def test_correcting_saved_schedule_source_keeps_series_and_original_poster(tmp_p
         )
         chat = Chat(id=111, type="private")
         original = Message(
-            message_id=2,
+            message_id=3,
             date=NOW,
             chat=chat,
             caption="Ошибочный шаблон",
@@ -140,34 +194,14 @@ def test_correcting_saved_schedule_source_keeps_series_and_original_poster(tmp_p
             reply_to_message=Message(message_id=101, date=NOW, chat=chat),
         ).as_(bot)
         await ingest_message(original, store)
-        source = await store.get_source(111, 2)
-        assert source is not None and source.status == "failed"
-        await show_source(original, source, store)
-        source_card_id = 100 + len(session.messages)
-        await ingest_message(
-            Message(
-                message_id=3,
-                date=NOW,
-                chat=chat,
-                text="Ошибочная подпись",
-                reply_to_message=Message(message_id=source_card_id, date=NOW, chat=chat),
-            ).as_(bot),
-            Store(store.path),
-        )
-        bad_text_source = await store.get_source(111, 3)
-        assert bad_text_source is not None and bad_text_source.status == "failed"
-        await show_source(
-            Message(
-                message_id=3,
-                date=NOW,
-                chat=chat,
-                text="Ошибочная подпись",
-                reply_to_message=Message(message_id=source_card_id, date=NOW, chat=chat),
-            ).as_(bot),
-            bad_text_source,
-            Store(store.path),
-        )
-        bad_source_card_id = 100 + len(session.messages)
+        source = await store.get_source(111, 3)
+        assert source is not None and source.status == "processed"
+        assert source.attachment_status == "none" and source.poster_path is None
+        assert await store.get_record(series_id) == record
+        assert await store.list_pending_schedule_changes() == []
+        assert (await store.get_automation_status()).incomplete_attachments == 0
+        assert not any(request.__class__.__name__ == "GetFile" for request in session.requests)
+
         corrected = Message(
             message_id=4,
             date=NOW,
@@ -175,7 +209,7 @@ def test_correcting_saved_schedule_source_keeps_series_and_original_poster(tmp_p
             text=(
                 "Действует с: 01.12.2099\nНазвание: Waving\nПервая дата: 01.12.2099\nВремя: 21:00"
             ),
-            reply_to_message=Message(message_id=bad_source_card_id, date=NOW, chat=chat),
+            reply_to_message=Message(message_id=101, date=NOW, chat=chat),
         ).as_(bot)
         await ingest_message(corrected, Store(store.path))
         actions = [
@@ -196,12 +230,12 @@ def test_correcting_saved_schedule_source_keeps_series_and_original_poster(tmp_p
         records = await store.list_records()
         assert len(records) == 1 and records[0].id == series_id
         assert records[0].data.title == "Waving"
-        assert records[0].poster_source_id == source.id
+        assert records[0].poster_source_id == original_poster_id
         assert len(await store.list_drafts()) == 1
-        original_source = await store.get_source_by_id(source.id)
+        original_source = await store.get_source_by_id(original_poster_id)
         assert original_source is not None and original_source.status == "processed"
         assert original_source.poster_path is not None
-        assert (tmp_path / original_source.poster_path).read_bytes() == session.poster_bytes
+        assert (tmp_path / original_source.poster_path).read_bytes() == b"poster"
         await bot.session.close()
 
     asyncio.run(scenario())
@@ -633,12 +667,12 @@ def test_reply_to_confirmed_class_uses_dated_schedule_and_keeps_photo(
 
         source = await store.get_source(111, 2)
         assert source is not None and source.text == text
-        assert source.attachment_status == "saved" and source.poster_path is not None
-        assert (tmp_path / source.poster_path).read_bytes() == session.poster_bytes
         assert len(await store.list_drafts()) == 1
         record = await store.get_record(series_id)
         assert record is not None and record.revision == 1
         if explicit_date:
+            assert source.attachment_status == "saved" and source.poster_path is not None
+            assert (tmp_path / source.poster_path).read_bytes() == session.poster_bytes
             previews = [
                 request
                 for request in session.requests
@@ -647,7 +681,10 @@ def test_reply_to_confirmed_class_uses_dated_schedule_and_keeps_photo(
             assert len(previews) == 1 and "01.12.2099" in previews[0].text
             assert source.status == "processed"
         else:
-            assert source.status == "failed"
+            assert source.status == "processed"
+            assert source.attachment_status == "none" and source.poster_path is None
+            assert await store.list_pending_schedule_changes() == []
+            assert not any(request.__class__.__name__ == "GetFile" for request in session.requests)
             assert "Действует с" in "\n".join(session.messages)
         await bot.session.close()
 
@@ -1030,21 +1067,21 @@ def test_schedule_resolution_replay_is_idempotent_and_pending_can_be_reopened(
         assert replay.version == pending.version + 1
         assert await reopened.list_pending_schedule_changes() == [resolved]
 
-        with pytest.raises(ValueError, match="устарело"):
+        with pytest.raises(ValueError, match="Расписание изменилось"):
             await reopened.resolve_schedule_change(
                 pending.id,
                 resolved.version + 1,
                 original_date=date(2026, 11, 10),
                 resolution="remove",
             )
-        with pytest.raises(ValueError, match="устарел"):
+        with pytest.raises(ValueError, match="Расписание изменилось"):
             await reopened.resolve_schedule_change(
                 pending.id,
                 pending.version,
                 original_date=date(2026, 11, 10),
                 resolution="detach",
             )
-        with pytest.raises(ValueError, match="устарела"):
+        with pytest.raises(ValueError, match="Расписание изменилось"):
             await reopened.confirm_schedule_change(pending.id, pending.version, NOW)
 
         await reopened.confirm_schedule_change(resolved.id, resolved.version, NOW)

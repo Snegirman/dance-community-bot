@@ -257,7 +257,7 @@ def test_schedule_change_confirmation_is_idempotent_and_rejects_stale_draft(
         confirmed = await store.propose_schedule_change(first_change, now)
         replacement = await store.propose_schedule_change(replacement_change, now)
 
-        with pytest.raises(ValueError, match="устар|замен"):
+        with pytest.raises(ValueError, match="Расписание изменилось"):
             await store.confirm_schedule_change(confirmed.id, confirmed.version, now)
         await store.confirm_schedule_change(replacement.id, replacement.version, now)
         await store.confirm_schedule_change(replacement.id, replacement.version, now)
@@ -323,7 +323,7 @@ def test_removing_exception_does_not_reuse_its_revision_or_old_button(
             new_date=date(2026, 11, 25),
             new_time=time(21),
         )
-        with pytest.raises(ValueError, match="устар|ревиз"):
+        with pytest.raises(ValueError, match="Расписание изменилось"):
             await store.propose_schedule_change(stale_button, now)
 
         fresh_button = stale_button.model_copy(update={"expected_exception_revision": 2})

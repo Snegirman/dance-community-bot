@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 from collections.abc import AsyncGenerator, Iterator
 from datetime import UTC, date, datetime, tzinfo
 from pathlib import Path
@@ -119,6 +118,9 @@ def app(tmp_path: Path) -> tuple[Dispatcher, Store]:
         telegram_webhook_url="https://dance.example.org/telegram/webhook",
         telegram_webhook_secret=SecretStr("test_webhook_secret"),
         database_path=tmp_path / "dance.sqlite3",
+        telegram_group_id=None,
+        weekly_publication_time=None,
+        _env_file=None,
     )
     store = Store(settings.database_path)
     asyncio.run(store.initialize())
@@ -293,7 +295,7 @@ def test_preview_selects_current_moscow_week_or_explicit_date(
     assert "Событие выбранной недели" in "\n".join(message_texts(session))
 
 
-def test_preview_sends_photo_and_preserves_long_escaped_content(
+def test_preview_sends_photo_and_preserves_long_literal_content(
     client: tuple[Bot, RecordingSession],
     app: tuple[Dispatcher, Store],
 ) -> None:
@@ -336,18 +338,19 @@ def test_preview_sends_photo_and_preserves_long_escaped_content(
     assert isinstance(photos[0].photo, FSInputFile)
     assert photos[0].photo.path.resolve() == (store.path.parent / "posters/poster.jpg")
     assert photos[0].caption is not None
-    assert "&lt;&gt;&amp;" in photos[0].caption
+    assert "<>&" in photos[0].caption
+    assert photos[0].parse_mode is None
+    assert photos[0].caption_entities
+    assert all(method.parse_mode is None for method in messages)
     assert "личный исходный текст" not in "".join(
         method.text if isinstance(method, SendMessage) else method.caption or ""
         for method in session.requests
         if isinstance(method, (SendMessage, SendPhoto))
     )
-    assert all(
-        len(html.unescape(method.text).encode("utf-16-le")) // 2 <= 4096 for method in messages
-    )
-    assert len(html.unescape(photos[0].caption).encode("utf-16-le")) // 2 <= 1024
+    assert all(len(method.text.encode("utf-16-le")) // 2 <= 4096 for method in messages)
+    assert len(photos[0].caption.encode("utf-16-le")) // 2 <= 1024
     delivered = "".join(
-        html.unescape(method.text if isinstance(method, SendMessage) else method.caption or "")
+        method.text if isinstance(method, SendMessage) else method.caption or ""
         for method in session.requests
         if isinstance(method, (SendMessage, SendPhoto))
     )

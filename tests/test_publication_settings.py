@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from aiogram import Bot, Dispatcher
+from aiogram.enums import MessageEntityType
 from aiogram.methods import SendMessage
 from aiogram.types import CallbackQuery, Chat, ForceReply, Message, Update, User
 from telegram_transport import RecordingSession
@@ -136,7 +137,8 @@ def test_settings_shows_database_time_and_buttons(tmp_path: Path) -> None:
         await store.initialize(time(10, 30))
         session = RecordingSession(OWNER_ID)
         bot = Bot(token=TOKEN, session=session)
-        dispatcher = create_dispatcher(make_settings(store.path), store)
+        settings = make_settings(store.path).model_copy(update={"telegram_group_id": None})
+        dispatcher = create_dispatcher(settings, store)
         try:
             await dispatcher.feed_update(
                 bot,
@@ -148,6 +150,13 @@ def test_settings_shows_database_time_and_buttons(tmp_path: Path) -> None:
 
             response = sent_messages(session)[-1]
             assert "10:30" in response.text
+            assert response.text.startswith("⚙️ Настройки автопубликации\n")
+            assert "Время по понедельникам (Europe/Moscow): 10:30" in response.text
+            assert "Автопубликация: включена" not in response.text
+            assert "/status" in response.text
+            assert response.parse_mode is None
+            assert response.entities is not None
+            assert any(entity.type == MessageEntityType.BOLD for entity in response.entities)
             assert button_data(response, "Изменить время")
             assert button_data(response, "Отключить автопубликацию")
         finally:

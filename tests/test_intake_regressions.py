@@ -7,11 +7,11 @@ from pathlib import Path
 
 import pytest
 from aiogram import Bot
-from aiogram.methods import SendMessage
-from aiogram.types import CallbackQuery, Chat, Message, PhotoSize, User
+from aiogram.methods import SendMessage, SendPhoto
+from aiogram.types import CallbackQuery, Chat, ForceReply, Message, PhotoSize, User
 from telegram_transport import RecordingSession
 
-from dance_community_bot.cards import _chunks, format_card, show_draft, show_record
+from dance_community_bot.cards import _chunks, format_card, show_draft, show_events, show_record
 from dance_community_bot.intake import handle_card_action, ingest_message
 from dance_community_bot.models import CardBinding, EventData, SourceInput
 from dance_community_bot.storage import Store
@@ -102,6 +102,112 @@ def callback_for(bot: Bot, token: str, message_id: int) -> CallbackQuery:
     ).as_(bot)
 
 
+def test_rejected_stale_reply_repeats_the_same_next_step_after_restart(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        await store.initialize()
+        source = await store.save_source(
+            SourceInput(chat_id=OWNER_ID, message_id=1, received_at=NOW, text=TEMPLATE)
+        )
+        data = EventData(title="Джем", event_type="Джем", start_date=date(2026, 11, 14))
+        draft = await store.save_draft(source.id, data, poster_source_id=None)
+        await store.bind_card_message(
+            CardBinding(
+                chat_id=OWNER_ID,
+                bot_message_id=1000,
+                record_id=draft.record_id,
+                draft_id=draft.id,
+                version=draft.version,
+            )
+        )
+        await store.reject_draft(draft.id, draft.version)
+        session = RecordingSession(OWNER_ID)
+        bot = Bot(token=TOKEN, session=session)
+        try:
+            reply = photo_message(bot, reply_id=1000)
+            await ingest_message(reply, store)
+            initial_rejection = session.messages[-1]
+            assert "/events" in initial_rejection
+
+            await ingest_message(reply, Store(store.path))
+
+            assert session.messages[-1] == initial_rejection
+            assert not any(request.__class__.__name__ == "GetFile" for request in session.requests)
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_album_reply_to_edit_invitation_keeps_card_context_after_restart(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "album-edit.sqlite3")
+        await store.initialize()
+        original = await store.save_source(
+            SourceInput(
+                chat_id=OWNER_ID,
+                message_id=1,
+                received_at=NOW,
+                text=TEMPLATE,
+                telegram_file_id="original-poster",
+                is_photo=True,
+            )
+        )
+        poster_path = Path("posters") / f"{original.id}.jpg"
+        (store.path.parent / poster_path).write_bytes(b"unchanged poster")
+        await store.set_source_poster_path(original.id, poster_path)
+        draft = await store.save_draft(
+            original.id,
+            EventData(title="Джем", event_type="Джем", start_date=date(2026, 11, 14)),
+            poster_source_id=original.id,
+        )
+        record = await store.confirm_draft(draft.id, draft.version)
+        action = await store.create_card_action(
+            "edit", record_id=record.id, revision=record.revision
+        )
+        await store.bind_card_actions(OWNER_ID, 1000, [action.token])
+
+        session = RecordingSession(OWNER_ID)
+        bot = Bot(token=TOKEN, session=session)
+        try:
+            await handle_card_action(callback_for(bot, action.token, 1000), store)
+            prompt_message_id = 100 + len(session.messages) + len(session.photos)
+            binding = await store.get_card_binding(OWNER_ID, prompt_message_id)
+            assert binding is not None and binding.record_id == record.id
+
+            album = photo_message(bot, reply_id=prompt_message_id).model_copy(
+                update={"message_id": 2, "media_group_id": "edit-album"}
+            )
+            await ingest_message(album, store)
+            first_rejection = session.messages[-1]
+            assert "Карточка не изменена" in first_rejection
+            assert "ответом на приглашение" in first_rejection
+
+            await ingest_message(album, Store(store.path))
+            repeated_rejection = session.messages[-1]
+            assert "Карточка не изменена" in repeated_rejection
+            assert "ответом на приглашение" in repeated_rejection
+            assert "Отправьте полный шаблон /event или /class заново" not in first_rejection
+            assert not any(request.__class__.__name__ == "GetFile" for request in session.requests)
+
+            rejected = await store.get_source(OWNER_ID, 2)
+            assert rejected is not None
+            assert rejected.status == "processed"
+            assert rejected.attachment_status == "none"
+            assert rejected.poster_path is None
+            assert await store.get_record(record.id) == record
+            assert not [item for item in await store.list_drafts() if item.status == "pending"]
+            assert len(await store.list_records()) == 1
+            assert len(await store.list_sources()) == 2
+            restored_poster = await store.get_source_by_id(original.id)
+            assert restored_poster is not None and restored_poster.poster_path == poster_path
+            assert (store.path.parent / poster_path).read_bytes() == b"unchanged poster"
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())
+
+
 def test_callback_token_from_another_message_cannot_confirm(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = Store(tmp_path / "dance.sqlite3")
@@ -158,7 +264,7 @@ def test_long_incoming_draft_binds_confirmation_to_last_delivered_chunk(tmp_path
             drafts = await store.list_drafts()
             assert len(drafts) == 1
             preview = (
-                f"Черновик №{drafts[0].record_id} · версия {drafts[0].version}\n\n"
+                f"Черновик №{drafts[0].record_id}\n\n"
                 f"{format_card(drafts[0].data)}\n\nАфиша: не добавлена"
             )
             assert len(_chunks(preview)) == 2
@@ -351,6 +457,13 @@ def test_reply_to_edit_prompt_after_restart_keeps_record_identity(tmp_path: Path
         bot = Bot(token=TOKEN, session=session)
         try:
             await handle_card_action(callback_for(bot, action.token, 1000), store)
+            prompt = session.requests[0]
+            assert prompt.reply_markup is not None
+            assert isinstance(prompt.reply_markup, ForceReply)
+            assert prompt.reply_markup.selective is not True
+            assert "шаблоном" in prompt.text.lower()
+            assert "ответьте" in prompt.text.lower()
+            assert "новую запись" in prompt.text.lower()
             correction = Message(
                 message_id=2,
                 date=NOW,
@@ -418,7 +531,67 @@ def test_remove_confirmed_poster_preserves_original_until_confirmation(tmp_path:
     asyncio.run(scenario())
 
 
-def test_retry_source_without_draft_downloads_after_restart(tmp_path: Path) -> None:
+def test_view_action_after_restart_sends_saved_poster_and_keeps_actions_bound(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database_path = tmp_path / "dance.sqlite3"
+        store = Store(database_path)
+        await store.initialize()
+        source = await store.save_source(
+            SourceInput(
+                chat_id=OWNER_ID,
+                message_id=1,
+                received_at=NOW,
+                text=TEMPLATE,
+                telegram_file_id="saved-poster",
+                is_photo=True,
+            )
+        )
+        poster_path = Path("posters/saved.jpg")
+        full_poster_path = database_path.parent / poster_path
+        full_poster_path.parent.mkdir(parents=True, exist_ok=True)
+        full_poster_path.write_bytes(b"saved poster")
+        await store.set_source_poster_path(source.id, poster_path)
+        data = EventData(title="Джем", event_type="Джем", start_date=date(2026, 11, 14))
+        draft = await store.save_draft(source.id, data, poster_source_id=source.id)
+        record = await store.confirm_draft(draft.id, draft.version)
+
+        session = RecordingSession(OWNER_ID)
+        bot = Bot(token=TOKEN, session=session)
+        restarted = Store(database_path)
+        await restarted.initialize()
+        view = await restarted.create_card_action(
+            "view", record_id=record.id, revision=record.revision
+        )
+        await restarted.bind_card_actions(OWNER_ID, 900, [view.token])
+
+        await handle_card_action(callback_for(bot, view.token, 900), restarted)
+
+        outgoing = [
+            request for request in session.requests if isinstance(request, SendPhoto | SendMessage)
+        ]
+        assert len(outgoing) == 2
+        assert isinstance(outgoing[0], SendPhoto)
+        assert isinstance(outgoing[1], SendMessage)
+        card_message = outgoing[1]
+        assert format_card(data) in card_message.text
+        assert card_message.reply_markup is not None
+        buttons = [button for row in card_message.reply_markup.inline_keyboard for button in row]
+        edit_button = next(button for button in buttons if button.text == "Исправить")
+        assert edit_button.callback_data is not None
+        edit_action = await restarted.get_card_action(edit_button.callback_data.removeprefix("a:"))
+        assert edit_action is not None and edit_action.bot_message_id == 102
+        photo_binding = await restarted.get_card_binding(OWNER_ID, 101)
+        text_binding = await restarted.get_card_binding(OWNER_ID, 102)
+        assert photo_binding is not None and photo_binding.record_id == record.id
+        assert text_binding is not None and text_binding.record_id == record.id
+        await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_valid_source_without_draft_retries_failed_poster_after_restart(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = Store(tmp_path / "dance.sqlite3")
         await store.initialize()
@@ -427,6 +600,7 @@ def test_retry_source_without_draft_downloads_after_restart(tmp_path: Path) -> N
                 chat_id=OWNER_ID,
                 message_id=1,
                 received_at=NOW,
+                text=TEMPLATE,
                 telegram_file_id="poster",
                 is_photo=True,
             )
@@ -442,39 +616,116 @@ def test_retry_source_without_draft_downloads_after_restart(tmp_path: Path) -> N
             assert restored is not None and restored.poster_path is not None
             assert (store.path.parent / restored.poster_path).read_bytes() == session.poster_bytes
             assert await store.list_records() == []
-            assert await store.list_drafts() == []
+            drafts = await store.list_drafts()
+            assert len(drafts) == 1
+            assert drafts[0].poster_source_id == source.id
         finally:
             await session.close()
 
     asyncio.run(scenario())
 
 
-def test_correcting_failed_caption_by_reply_keeps_saved_poster(tmp_path: Path) -> None:
+def test_invalid_edit_does_not_download_or_change_card_or_original_poster(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = Store(tmp_path / "dance.sqlite3")
         await store.initialize()
+        original = await store.save_source(
+            SourceInput(
+                chat_id=OWNER_ID,
+                message_id=1,
+                received_at=NOW,
+                text=TEMPLATE,
+                telegram_file_id="original-poster",
+                is_photo=True,
+            )
+        )
+        poster_path = Path("posters/original.jpg")
+        (store.path.parent / poster_path).parent.mkdir(parents=True, exist_ok=True)
+        (store.path.parent / poster_path).write_bytes(b"original poster")
+        await store.set_source_poster_path(original.id, poster_path)
+        draft = await store.save_draft(
+            original.id,
+            EventData(title="Старый джем", event_type="Джем", start_date=date(2026, 11, 14)),
+            poster_source_id=original.id,
+        )
+        record = await store.confirm_draft(draft.id, draft.version)
         session = RecordingSession(OWNER_ID)
         bot = Bot(token=TOKEN, session=session)
         try:
-            invalid = photo_message(bot).model_copy(update={"caption": "Название: Джем"})
-            await ingest_message(invalid, store)
-            source = await store.get_source(OWNER_ID, 2)
-            assert source is not None and source.poster_path is not None
-            assert await store.list_drafts() == []
-            correction = Message(
+            await show_record(photo_message(bot), record, store)
+            card_message_id = 100 + len(session.messages)
+            invalid = Message(
                 message_id=3,
                 date=NOW,
                 chat=Chat(id=OWNER_ID, type="private"),
                 from_user=User(id=OWNER_ID, is_bot=False, first_name="Владелец"),
-                text=TEMPLATE,
+                caption="Название: Новое название",
+                photo=[PhotoSize(file_id="new-poster", file_unique_id="new", width=20, height=20)],
                 reply_to_message=Message(
-                    message_id=101, date=NOW, chat=Chat(id=OWNER_ID, type="private")
+                    message_id=card_message_id,
+                    date=NOW,
+                    chat=Chat(id=OWNER_ID, type="private"),
                 ),
             ).as_(bot)
-            await ingest_message(correction, Store(store.path))
-            drafts = await store.list_drafts()
-            assert len(drafts) == 1
-            assert drafts[0].poster_source_id == source.id
+            await ingest_message(invalid, Store(store.path))
+
+            rejected = await store.get_source(OWNER_ID, 3)
+            current = await store.get_record(record.id)
+            assert rejected is not None and rejected.status == "processed"
+            assert rejected.attachment_status == "none" and rejected.poster_path is None
+            assert current == record
+            assert not [draft for draft in await store.list_drafts() if draft.status == "pending"]
+            assert (store.path.parent / poster_path).read_bytes() == b"original poster"
+            assert not any(request.__class__.__name__ == "GetFile" for request in session.requests)
+            assert "полный шаблон" in session.messages[-1].lower()
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_legacy_invalid_photo_source_is_rechecked_without_recovery_or_download(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        await store.initialize()
+        source = await store.save_source(
+            SourceInput(
+                chat_id=OWNER_ID,
+                message_id=2,
+                received_at=NOW,
+                text="Название: неполный шаблон",
+                telegram_file_id="legacy-poster",
+                is_photo=True,
+            )
+        )
+        poster_path = Path("posters/legacy.jpg")
+        (store.path.parent / poster_path).parent.mkdir(parents=True, exist_ok=True)
+        (store.path.parent / poster_path).write_bytes(b"historical poster")
+        await store.set_source_poster_path(source.id, poster_path)
+        await store.set_source_error(source.id, "Сохранённая старая ошибка проверки шаблона")
+
+        session = RecordingSession(OWNER_ID)
+        bot = Bot(token=TOKEN, session=session)
+        try:
+            invalid = photo_message(bot).model_copy(update={"caption": "Название: неполный шаблон"})
+            restarted = Store(store.path)
+            await restarted.initialize()
+            await ingest_message(invalid, restarted)
+            await ingest_message(invalid, restarted)
+
+            restored = await restarted.get_source(OWNER_ID, 2)
+            assert restored is not None and restored.status == "processed"
+            assert restored.attachment_status == "saved" and restored.poster_path == poster_path
+            assert (store.path.parent / poster_path).read_bytes() == b"historical poster"
+            assert len(await restarted.list_sources()) == 1
+            assert await restarted.list_drafts() == []
+            assert await restarted.list_records() == []
+            assert (await restarted.get_automation_status()).incomplete_attachments == 0
+            assert not any(request.__class__.__name__ == "GetFile" for request in session.requests)
+            await show_events(invalid, restarted)
+            assert "неполный шаблон" not in session.messages[-1].lower()
         finally:
             await session.close()
 
@@ -544,9 +795,7 @@ def test_mixed_russian_and_emoji_card_splits_at_utf16_boundary(
         try:
             await show_draft(photo_message(bot), draft, store)
             expected = (
-                f"Черновик №{draft.record_id} · версия {draft.version}\n\n"
-                f"{format_card(draft.data)}\n\n"
-                "Афиша: не добавлена"
+                f"Черновик №{draft.record_id}\n\n{format_card(draft.data)}\n\nАфиша: не добавлена"
             )
             assert "".join(session.messages) == expected
             assert all(len(text.encode("utf-16-le")) // 2 <= 4096 for text in session.messages)

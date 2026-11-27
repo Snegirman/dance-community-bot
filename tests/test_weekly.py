@@ -109,6 +109,35 @@ def test_week_bounds_use_moscow_mondays_and_reject_unrepresentable_range() -> No
         week_bounds(date.max)
 
 
+def test_weekly_post_keeps_formatted_headings_for_both_sections(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        await store.initialize()
+        await add_class(
+            store,
+            1,
+            ClassData(title="Popping", first_date=date(2026, 11, 10), start_time=time(19)),
+        )
+        await add_event(
+            store,
+            2,
+            EventData(
+                title="Джем",
+                event_type="Джем",
+                start_date=date(2026, 11, 11),
+            ),
+        )
+
+        post = await build_weekly_post(date(2026, 11, 9), store)
+        text_parts = [part.text for part in post.parts if part.kind == "text"]
+
+        assert len(text_parts) == 2
+        assert text_parts[0].startswith("🩰 Занятия\n")
+        assert text_parts[1].startswith("🎟 События\n")
+
+    asyncio.run(scenario())
+
+
 def test_event_ending_on_date_max_does_not_overflow(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = Store(tmp_path / "dance.sqlite3")

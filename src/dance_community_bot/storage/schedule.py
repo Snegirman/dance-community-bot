@@ -36,6 +36,9 @@ class ScheduleStorage(StorageBase):
     async def list_pending_schedule_changes(self) -> list[ChangeDraft]:
         return await asyncio.to_thread(self._list_pending_schedule_changes_sync)
 
+    async def get_schedule_change_for_source(self, source_id: int) -> ChangeDraft | None:
+        return await asyncio.to_thread(self._get_schedule_change_for_source_sync, source_id)
+
     async def get_schedule_exception_revision(
         self, series_id: int, original_date: date
     ) -> int | None:
@@ -74,6 +77,13 @@ class ScheduleStorage(StorageBase):
                 "SELECT * FROM schedule_change_drafts WHERE status = 'pending' ORDER BY id"
             ).fetchall()
             return [self._schedule_draft_from_row(row) for row in rows]
+
+    def _get_schedule_change_for_source_sync(self, source_id: int) -> ChangeDraft | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM schedule_change_drafts WHERE source_id = ?", (source_id,)
+            ).fetchone()
+            return self._schedule_draft_from_row(row) if row is not None else None
 
     def _get_schedule_exception_revision_sync(
         self, series_id: int, original_date: date
@@ -123,7 +133,7 @@ class ScheduleStorage(StorageBase):
             if record is None:
                 raise ValueError("Неизвестная или неактивная серия занятий.")
             if record["revision"] != change.expected_revision:
-                raise ValueError("Ревизия расписания устарела.")
+                raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")
 
             base_exception_revision: int | None = None
             if isinstance(change, OccurrenceChange):
@@ -137,7 +147,9 @@ class ScheduleStorage(StorageBase):
                     exception_row["revision"] if exception_row is not None else None
                 )
                 if change.expected_exception_revision != base_exception_revision:
-                    raise ValueError("Ревизия исключения устарела.")
+                    raise ValueError(
+                        "Расписание изменилось. Откройте /schedule и повторите действие."
+                    )
                 if isinstance(change, RemoveException) and (
                     exception_row is None or exception_row["archived"]
                 ):
@@ -202,6 +214,19 @@ class ScheduleStorage(StorageBase):
                     "UPDATE sources SET status = 'processed', error_reason = NULL WHERE id = ?",
                     (change.source_id,),
                 )
+            if isinstance(change, ChangeSeries) and change.poster_source_id is not None:
+                poster = self._source_row(connection, change.poster_source_id)
+                if (
+                    poster is not None
+                    and poster["is_photo"]
+                    and poster["attachment_status"] == "saved"
+                    and poster["poster_path"] is not None
+                    and (self.path.parent / poster["poster_path"]).is_file()
+                ):
+                    connection.execute(
+                        "UPDATE sources SET status = 'processed', error_reason = NULL WHERE id = ?",
+                        (change.poster_source_id,),
+                    )
             row = connection.execute(
                 "SELECT * FROM schedule_change_drafts WHERE id = ?", (draft_id,)
             ).fetchone()
@@ -223,7 +248,7 @@ class ScheduleStorage(StorageBase):
             if row is None:
                 raise ValueError("Неизвестное изменение расписания.")
             if row["status"] != "pending":
-                raise ValueError("Подтверждение изменения устарело.")
+                raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")
             change = _SCHEDULE_CHANGE_ADAPTER.validate_json(row["change_json"])
             if not isinstance(change, (ChangeSeries, EndSeries)):
                 raise ValueError("Для этого изменения решения не требуются.")
@@ -237,11 +262,11 @@ class ScheduleStorage(StorageBase):
                 raise ValueError("Отменённое проведение нельзя отделить от серии.")
             resolutions = dict(change.resolutions)
             if version <= 0 or row["version"] < version:
-                raise ValueError("Подтверждение изменения устарело.")
+                raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")
             if resolutions.get(original_date) == resolution:
                 return self._schedule_draft_from_row(row)
             if row["version"] != version:
-                raise ValueError("Подтверждение изменения устарело.")
+                raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")
             resolutions[original_date] = resolution
             updated_change = change.model_copy(update={"resolutions": resolutions})
             next_version = version + 1
@@ -266,11 +291,11 @@ class ScheduleStorage(StorageBase):
             if row is None:
                 raise ValueError("Неизвестное изменение расписания.")
             if row["version"] != version:
-                raise ValueError("Версия изменения расписания устарела.")
+                raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")
             if row["status"] == "confirmed":
                 return
             if row["status"] != "pending":
-                raise ValueError("Изменение расписания уже заменено.")
+                raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")
 
             change = _SCHEDULE_CHANGE_ADAPTER.validate_json(row["change_json"])
             record = connection.execute(
@@ -278,7 +303,7 @@ class ScheduleStorage(StorageBase):
                 (row["series_id"],),
             ).fetchone()
             if record is None or record["revision"] != row["base_revision"]:
-                raise ValueError("Ревизия расписания изменилась после предпросмотра.")
+                raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")
 
             if isinstance(change, ChangeSeries) and change.poster_source_id is not None:
                 poster = self._source_row(connection, change.poster_source_id)
@@ -302,12 +327,16 @@ class ScheduleStorage(StorageBase):
                     current_exception["revision"] if current_exception is not None else None
                 )
                 if current_revision != row["base_exception_revision"]:
-                    raise ValueError("Исключение изменилось после предпросмотра.")
+                    raise ValueError(
+                        "Расписание изменилось. Откройте /schedule и повторите действие."
+                    )
                 if (
                     self._version_on_date(connection, change.series_id, change.original_date)
                     is None
                 ):
-                    raise ValueError("Проведение изменилось после предпросмотра.")
+                    raise ValueError(
+                        "Расписание изменилось. Откройте /schedule и повторите действие."
+                    )
                 self._apply_occurrence_change(connection, change, current_exception, now)
             elif isinstance(change, (ChangeSeries, EndSeries)):
                 self._validate_series_change_date(change, now)
@@ -316,7 +345,9 @@ class ScheduleStorage(StorageBase):
                 )
                 current_affected = self._affected_exceptions(connection, change)
                 if previous_affected != current_affected:
-                    raise ValueError("Состав исключений изменился; повторно откройте предпросмотр.")
+                    raise ValueError(
+                        "Расписание изменилось. Откройте /schedule и повторите действие."
+                    )
                 expected_dates = {item.original_date for item in current_affected}
                 if set(change.resolutions) != expected_dates:
                     raise ValueError("Сначала выберите решение для каждого затронутого исключения.")
@@ -356,7 +387,7 @@ class ScheduleStorage(StorageBase):
             if row is None:
                 raise ValueError("Неизвестное изменение расписания.")
             if row["version"] != version or row["status"] != "pending":
-                raise ValueError("Предпросмотр устарел и уже не может быть удалён.")
+                raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")
             connection.execute(
                 "UPDATE schedule_change_drafts SET status = 'superseded' "
                 "WHERE id = ? AND version = ? AND status = 'pending'",
@@ -547,7 +578,7 @@ class ScheduleStorage(StorageBase):
     ) -> None:
         current = self._exception_row(connection, series_id, exception.original_date)
         if current is None or current["archived"] or current["revision"] != exception.revision:
-            raise ValueError("Исключение изменилось; повторно откройте предпросмотр.")
+            raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")
         if resolution == "remove":
             self._archive_exception(connection, current, now)
             return
@@ -687,7 +718,7 @@ class ScheduleStorage(StorageBase):
             ),
         )
         if updated.rowcount != 1:
-            raise ValueError("Серия изменилась до подтверждения расписания.")
+            raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")
 
     def _apply_series_end(
         self,
@@ -743,7 +774,7 @@ class ScheduleStorage(StorageBase):
                 ),
             )
         if updated.rowcount != 1:
-            raise ValueError("Серия изменилась до завершения расписания.")
+            raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")
 
     @staticmethod
     def _append_exception_history(
@@ -778,7 +809,7 @@ class ScheduleStorage(StorageBase):
             (row["id"], row["revision"]),
         )
         if updated.rowcount != 1:
-            raise ValueError("Исключение изменилось до снятия.")
+            raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")
 
     @staticmethod
     def _upsert_schedule_exception(
@@ -830,4 +861,4 @@ class ScheduleStorage(StorageBase):
             ),
         )
         if updated.rowcount != 1:
-            raise ValueError("Исключение изменилось до сохранения.")
+            raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")

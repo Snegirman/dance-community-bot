@@ -7,11 +7,12 @@ from pathlib import Path
 
 import pytest
 from aiogram import Bot
+from aiogram.enums import MessageEntityType
 from aiogram.methods import SendMessage
 from aiogram.types import CallbackQuery, Chat, Document, Message, PhotoSize, User
 from telegram_transport import RecordingSession
 
-from dance_community_bot.cards import show_record
+from dance_community_bot.cards import show_events, show_record
 from dance_community_bot.intake import handle_card_action, ingest_message
 from dance_community_bot.models import ClassData, EventData, Source
 from dance_community_bot.storage import Store
@@ -167,10 +168,20 @@ def test_invalid_template_keeps_source_without_creating_record(tmp_path: Path) -
 
         source = await store.get_source(CHAT_ID, 17)
         assert source is not None
-        assert source.status == "failed"
-        assert "сохран" in (source.error_reason or "").lower()
+        assert source.status == "processed"
+        assert source.attachment_status == "none"
+        assert "шаблон" in (source.error_reason or "").lower()
         assert await store.list_drafts() == []
         assert await store.list_records() == []
+        rejection = next(
+            request for request in session.requests if isinstance(request, SendMessage)
+        )
+        assert rejection.parse_mode is None
+        assert rejection.entities is not None
+        assert any(
+            entity.type == MessageEntityType.BOLD and entity.offset == 0
+            for entity in rejection.entities
+        )
         await bot.session.close()
 
     asyncio.run(scenario())
@@ -211,7 +222,7 @@ def test_conflicting_date_markers_and_reply_type_change_are_rejected(tmp_path: P
         await ingest_message(make_message(bot, text=conflicting), store)
 
         conflict_source = await store.get_source(CHAT_ID, 17)
-        assert conflict_source is not None and conflict_source.status == "failed"
+        assert conflict_source is not None and conflict_source.status == "processed"
         assert await store.list_drafts() == []
         await ingest_message(make_message(bot, text=EVENT_TEMPLATE, message_id=18), store)
         bound_card_id = 102
@@ -229,7 +240,7 @@ def test_conflicting_date_markers_and_reply_type_change_are_rejected(tmp_path: P
 
         source = await store.get_source(CHAT_ID, 19)
         pending = [draft for draft in await store.list_drafts() if draft.status == "pending"]
-        assert source is not None and source.status == "failed"
+        assert source is not None and source.status == "processed"
         assert len(pending) == 1
         assert isinstance(pending[0].data, EventData)
         assert pending[0].data.title == "Popping Jam"
@@ -238,7 +249,9 @@ def test_conflicting_date_markers_and_reply_type_change_are_rejected(tmp_path: P
     asyncio.run(scenario())
 
 
-def test_photo_without_template_is_saved_as_visible_source_only(tmp_path: Path) -> None:
+def test_photo_without_template_is_rejected_without_download_or_events_recovery(
+    tmp_path: Path,
+) -> None:
     async def scenario() -> None:
         session = RecordingSession(CHAT_ID)
         bot = Bot(token=TOKEN, session=session)
@@ -250,15 +263,19 @@ def test_photo_without_template_is_saved_as_visible_source_only(tmp_path: Path) 
         source = await store.get_source(CHAT_ID, 17)
         assert source is not None
         assert source.is_photo
-        assert source.status == "failed"
-        assert source.attachment_status == "saved"
-        assert source.poster_path is not None
+        assert source.status == "processed"
+        assert source.attachment_status == "none"
+        assert source.poster_path is None
         assert await store.list_drafts() == []
         assert await store.list_records() == []
         get_file_requests = [
             request for request in session.requests if request.__class__.__name__ == "GetFile"
         ]
-        assert len(get_file_requests) == 1
+        assert get_file_requests == []
+        request_count = len(session.requests)
+        await show_events(make_message(bot), store)
+        assert len(session.requests) == request_count + 1
+        assert "незавершённых сообщений" in session.messages[-1]
         await bot.session.close()
 
     asyncio.run(scenario())
@@ -274,7 +291,8 @@ def test_album_and_document_are_saved_but_not_downloaded_as_posters(tmp_path: Pa
         await ingest_message(make_message(bot, photo=True, media_group_id="album-1"), store)
         album = await store.get_source(CHAT_ID, 17)
         assert album is not None
-        assert album.is_photo and album.status == "failed"
+        assert album.is_photo and album.status == "processed"
+        assert album.attachment_status == "none"
         assert album.poster_path is None
         assert "альбом" in (album.error_reason or "").lower()
 
@@ -283,7 +301,8 @@ def test_album_and_document_are_saved_but_not_downloaded_as_posters(tmp_path: Pa
         )
         document = await store.get_source(CHAT_ID, 18)
         assert document is not None
-        assert not document.is_photo and document.status == "failed"
+        assert not document.is_photo and document.status == "processed"
+        assert document.attachment_status == "none"
         assert "документ" in (document.error_reason or "").lower()
         assert not any(request.__class__.__name__ == "GetFile" for request in session.requests)
         assert await store.list_drafts() == []
@@ -292,7 +311,7 @@ def test_album_and_document_are_saved_but_not_downloaded_as_posters(tmp_path: Pa
     asyncio.run(scenario())
 
 
-def test_caption_validation_failure_preserves_downloaded_poster_and_source(tmp_path: Path) -> None:
+def test_invalid_photo_template_is_rejected_without_download_or_recovery(tmp_path: Path) -> None:
     async def scenario() -> None:
         session = RecordingSession(CHAT_ID)
         bot = Bot(token=TOKEN, session=session)
@@ -303,11 +322,20 @@ def test_caption_validation_failure_preserves_downloaded_poster_and_source(tmp_p
 
         source = await store.get_source(CHAT_ID, 17)
         assert source is not None
-        assert source.status == "failed"
-        assert source.poster_path is not None
-        assert (store.path.parent / source.poster_path).read_bytes() == session.poster_bytes
+        assert source.status == "processed"
+        assert source.attachment_status == "none"
+        assert source.poster_path is None
         assert await store.list_drafts() == []
         assert await store.list_records() == []
+        assert not any(request.__class__.__name__ == "GetFile" for request in session.requests)
+
+        restarted = Store(store.path)
+        await restarted.initialize()
+        await ingest_message(make_message(bot, text="Название: неполно", photo=True), restarted)
+        assert len(await restarted.list_sources()) == 1
+        assert await restarted.list_drafts() == []
+        assert await restarted.list_records() == []
+        assert not any(request.__class__.__name__ == "GetFile" for request in session.requests)
         await bot.session.close()
 
     asyncio.run(scenario())

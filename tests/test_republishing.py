@@ -870,7 +870,8 @@ def test_publish_old_week_recovers_incomplete_repeat_after_week_boundary(
         assert any(
             isinstance(request, SendMessage)
             and request.chat_id == OWNER_ID
-            and "Выпуск недели с 09.11.2026: доставлен." in request.text
+            and "Неделя: 09.11.2026." in request.text
+            and "Статус: доставлен." in request.text
             for request in session.requests
         )
 

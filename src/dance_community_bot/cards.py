@@ -5,8 +5,14 @@ from __future__ import annotations
 from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
+from .formatting import entities_for_text
 from .models import (
     CardActionName,
     CardBinding,
@@ -150,6 +156,15 @@ def _chunks(text: str) -> list[str]:
     return chunks
 
 
+async def _answer_chunks(message: Message, text: str) -> None:
+    for index, chunk in enumerate(_chunks(text)):
+        await message.answer(
+            chunk,
+            entities=entities_for_text(chunk, heading_lines=(0,) if index == 0 else ()),
+            parse_mode=None,
+        )
+
+
 async def _send_bound_text(
     message: Message,
     text: str,
@@ -160,8 +175,12 @@ async def _send_bound_text(
     sent_messages: list[Message] = []
     chunks = _chunks(text)
     for index, chunk in enumerate(chunks):
+        first_line = chunk.split("\n", maxsplit=1)[0].strip()
+        headings = (0,) if index == 0 and first_line and len(first_line) <= 100 else ()
         sent = await message.answer(
             chunk,
+            entities=entities_for_text(chunk, heading_lines=headings),
+            parse_mode=None,
             reply_markup=keyboard if index == len(chunks) - 1 else None,
         )
         if binding is not None:
@@ -181,6 +200,28 @@ async def _send_bound_text(
                 await store.bind_card_actions(sent.chat.id, sent.message_id, tokens)
         sent_messages.append(sent)
     return sent_messages
+
+
+async def _send_saved_poster(
+    message: Message,
+    poster_source_id: int | None,
+    store: Store,
+    binding: CardBinding,
+) -> Message | None:
+    if poster_source_id is None:
+        return None
+    source = await store.get_source_by_id(poster_source_id)
+    if source is None or source.attachment_status != "saved" or source.poster_path is None:
+        return None
+    poster_path = store.path.parent / source.poster_path
+    if not poster_path.is_file():
+        return None
+
+    sent = await message.answer_photo(FSInputFile(poster_path), parse_mode=None)
+    await store.bind_card_message(
+        binding.model_copy(update={"chat_id": sent.chat.id, "bot_message_id": sent.message_id})
+    )
+    return sent
 
 
 async def _action_button(
@@ -221,7 +262,13 @@ async def _action_button(
     return InlineKeyboardButton(text=label, callback_data=f"a:{action.token}")
 
 
-async def show_draft(message: Message, draft: Draft, store: Store) -> None:
+async def show_draft(
+    message: Message,
+    draft: Draft,
+    store: Store,
+    *,
+    with_poster: bool = False,
+) -> None:
     """Показать черновик с действиями, чьи намерения переживают перезапуск."""
     rows = [
         [
@@ -285,7 +332,7 @@ async def show_draft(message: Message, draft: Draft, store: Store) -> None:
                 ]
             )
 
-    lines = [f"Черновик №{draft.record_id} · версия {draft.version}", format_card(draft.data)]
+    lines = [f"Черновик №{draft.record_id}", format_card(draft.data)]
     if draft.poster_source_id is None:
         lines.append("Афиша: не добавлена")
     else:
@@ -322,10 +369,18 @@ async def show_draft(message: Message, draft: Draft, store: Store) -> None:
         revision=draft.base_revision,
         source_id=draft.source_id,
     )
+    if with_poster:
+        await _send_saved_poster(message, draft.poster_source_id, store, binding)
     await _send_bound_text(message, text, store, binding, keyboard)
 
 
-async def show_record(message: Message, record: Record, store: Store) -> None:
+async def show_record(
+    message: Message,
+    record: Record,
+    store: Store,
+    *,
+    with_poster: bool = False,
+) -> None:
     rows: list[list[InlineKeyboardButton]] = []
     if record.status == "active":
         if isinstance(record.data, ClassData):
@@ -388,17 +443,20 @@ async def show_record(message: Message, record: Record, store: Store) -> None:
             rows.append(row)
     keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
     poster = "Афиша: добавлена" if record.poster_source_id is not None else "Афиша: не добавлена"
-    status = "Статус: Отменена\n" if record.status == "cancelled" else ""
     binding = CardBinding(
         chat_id=message.chat.id,
         bot_message_id=0,
         record_id=record.id,
         revision=record.revision,
     )
+    if with_poster:
+        await _send_saved_poster(message, record.poster_source_id, store, binding)
+    card_heading = f"Карточка №{record.id}"
+    if record.status == "cancelled":
+        card_heading += " · отменена"
     await _send_bound_text(
         message,
-        f"Запись №{record.id} · ревизия {record.revision}\n{status}"
-        f"{format_card(record.data)}\n{poster}",
+        f"{card_heading}\n{format_card(record.data)}\n{poster}",
         store,
         binding,
         keyboard,
@@ -504,10 +562,7 @@ async def show_events(message: Message, store: Store, *, page: int = 0) -> None:
 async def _event_entry_text(item: Record | Draft | Source, store: Store) -> str:
     if isinstance(item, Record):
         poster = "добавлена" if item.poster_source_id is not None else "не добавлена"
-        return (
-            f"Запись №{item.id} · ревизия {item.revision}\n{format_card(item.data)}\n"
-            f"Афиша: {poster}"
-        )
+        return f"Карточка №{item.id}\n{format_card(item.data)}\nАфиша: {poster}"
     if isinstance(item, Draft):
         status = "новой записи" if item.base_revision is None else "исправления"
         source = (
@@ -522,7 +577,7 @@ async def _event_entry_text(item: Record | Draft | Source, store: Store) -> str:
         else:
             poster = "добавлена"
         lines = [
-            f"Черновик №{item.record_id} · версия {item.version} ({status})",
+            f"Черновик №{item.record_id} ({status})",
             format_card(item.data),
             f"Афиша: {poster}",
         ]
@@ -563,7 +618,7 @@ async def _event_entry_buttons(
     return [
         await _action_button(
             store,
-            f"Открыть сообщение {item.message_id}",
+            "Открыть источник",
             "view",
             source_id=item.id,
         )
@@ -571,8 +626,8 @@ async def _event_entry_buttons(
 
 
 def _source_card_text(source: Source) -> str:
-    reason = source.error_reason or "обработка не завершена"
-    label = "Афиша" if source.is_photo else "Сообщение"
+    reason = source.error_reason or "обработку не удалось завершить"
+    label = "Афиша" if source.is_photo else "Входное сообщение"
     state = {
         "none": "без вложения",
         "pending": "загрузка не завершена",
@@ -580,7 +635,13 @@ def _source_card_text(source: Source) -> str:
         "failed": "ошибка загрузки",
         "removed": "вложение убрано",
     }[source.attachment_status]
-    return f"{label} из сообщения {source.message_id} · {state}\nПричина: {reason}"
+    if source.is_photo and source.attachment_status in {"pending", "failed"}:
+        next_step = "Нажмите «Повторить загрузку афиши» или «Убрать афишу»."
+    elif source.is_photo:
+        next_step = "Отправьте афишу ещё раз вместе с полным шаблоном."
+    else:
+        next_step = "После исправления отправьте полный шаблон одним сообщением."
+    return f"{label}: {state}\nПричина: {reason}\nСледующий шаг: {next_step}"
 
 
 def _source_needs_attention(source: Source) -> bool:

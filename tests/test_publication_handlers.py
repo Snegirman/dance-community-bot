@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 from aiogram import Bot
+from aiogram.enums import MessageEntityType
 from aiogram.methods import GetChat, SendMessage, SendPhoto, TelegramMethod
 from aiogram.methods.base import TelegramType
 from aiogram.types import CallbackQuery, Chat, Message, Update, User
@@ -124,7 +125,22 @@ def test_publish_requires_confirmation_and_binds_callback_to_its_message(tmp_pat
                 for request in session.requests
                 if isinstance(request, (SendMessage, SendPhoto)) and request.chat_id == GROUP_ID
             ]
+            preview = next(
+                request
+                for request in session.requests
+                if isinstance(request, SendMessage)
+                and request.chat_id == OWNER_ID
+                and request.text.startswith("🎟 События")
+            )
             confirmation = _publish_confirmation(session)
+            assert preview.parse_mode is None
+            assert preview.entities is not None
+            assert any(entity.type == MessageEntityType.BOLD for entity in preview.entities)
+            assert confirmation.parse_mode is None
+            assert confirmation.entities is not None
+            assert any(entity.type == MessageEntityType.BOLD for entity in confirmation.entities)
+            assert "Целевая группа:" in confirmation.text
+            assert "сообщение " not in confirmation.text.casefold()
             button = next(
                 button
                 for row in confirmation.reply_markup.inline_keyboard
@@ -149,6 +165,13 @@ def test_publish_requires_confirmation_and_binds_callback_to_its_message(tmp_pat
             assert publication is not None
             assert publication.status == "delivered"
             assert publication.owner_message_id != _message_id(session, confirmation)
+            delivered_status = next(
+                request
+                for request in reversed(session.requests)
+                if isinstance(request, SendMessage) and request.chat_id == OWNER_ID
+            )
+            assert "Статус: доставлен." in delivered_status.text
+            assert "сообщение " not in delivered_status.text.casefold()
             group_sends = [
                 request
                 for request in session.requests
@@ -319,7 +342,7 @@ def test_unknown_photo_controls_retry_only_once_and_reject_stale_or_outsider_cal
         draft = await store.save_draft(
             source.id,
             EventData(
-                title="Афишный джэм",
+                title="Афишный <джэм>&",
                 event_type="Джэм",
                 start_date=date(2026, 11, 10),
             ),
@@ -337,6 +360,15 @@ def test_unknown_photo_controls_retry_only_once_and_reject_stale_or_outsider_cal
                     message=private_message(bot, 50, "/publish 10.11.2026"),
                 ),
             )
+            photo_preview = next(
+                request
+                for request in session.requests
+                if isinstance(request, SendPhoto) and request.chat_id == OWNER_ID
+            )
+            assert "<джэм>&" in photo_preview.caption
+            assert "&lt;джэм&gt;" not in photo_preview.caption
+            assert photo_preview.parse_mode is None
+            assert photo_preview.caption_entities
             confirmation = _publish_confirmation(session)
             confirm_button = next(
                 button

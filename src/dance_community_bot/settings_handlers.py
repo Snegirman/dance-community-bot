@@ -14,6 +14,7 @@ from aiogram.types import (
     Message,
 )
 
+from .formatting import entities_for_text
 from .models import WeeklyPublicationSetting
 from .scheduler import publication_schedule_lock
 from .storage import Store
@@ -22,11 +23,29 @@ _TIME_PATTERN = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 
 
 def _settings_text(setting: WeeklyPublicationSetting) -> str:
+    lines = ["⚙️ Настройки автопубликации"]
     if setting.weekly_publication_time is None:
-        value = "автопубликация отключена"
+        lines.append("Автопубликация: отключена")
     else:
-        value = f"время по понедельникам — {setting.weekly_publication_time:%H:%M} (Москва)"
-    return f"Настройки автопубликации: {value}."
+        lines.append(
+            f"Время по понедельникам (Europe/Moscow): {setting.weekly_publication_time:%H:%M}"
+        )
+        lines.append("Состояние автопубликации и целевая группа — /status.")
+    return "\n".join(lines)
+
+
+async def _answer_text(
+    message: Message,
+    text: str,
+    *,
+    reply_markup: ForceReply | InlineKeyboardMarkup | None = None,
+) -> Message:
+    return await message.answer(
+        text,
+        entities=entities_for_text(text, heading_lines=(0,)),
+        parse_mode=None,
+        reply_markup=reply_markup,
+    )
 
 
 def _settings_keyboard(setting: WeeklyPublicationSetting) -> InlineKeyboardMarkup:
@@ -51,7 +70,7 @@ def _settings_keyboard(setting: WeeklyPublicationSetting) -> InlineKeyboardMarku
 
 async def settings_command_handler(message: Message, store: Store) -> None:
     setting = await store.get_weekly_publication_setting()
-    await message.answer(_settings_text(setting), reply_markup=_settings_keyboard(setting))
+    await _answer_text(message, _settings_text(setting), reply_markup=_settings_keyboard(setting))
 
 
 async def settings_callback_handler(callback: CallbackQuery, store: Store) -> None:
@@ -83,15 +102,17 @@ async def settings_callback_handler(callback: CallbackQuery, store: Store) -> No
             )
             return
         await callback.answer("Автопубликация отключена.")
-        await target.answer(_settings_text(updated))
+        await _answer_text(target, _settings_text(updated))
         return
 
     if action != "time":
         await callback.answer("Кнопка настройки устарела.", show_alert=True)
         return
 
-    prompt = await target.answer(
-        "Ответьте на это сообщение временем по Москве в формате ЧЧ:ММ.",
+    prompt = await _answer_text(
+        target,
+        "🕒 Введите время автопубликации\n"
+        "Ответьте на это сообщение в формате ЧЧ:ММ по московскому времени.",
         reply_markup=ForceReply(selective=True),
     )
     bound = await store.bind_weekly_publication_prompt(target.chat.id, prompt.message_id, revision)
@@ -121,17 +142,19 @@ async def _handle_time_reply(message: Message, store: Store, *, edited: bool) ->
         return
     setting = await store.get_weekly_publication_setting()
     if prompt.status != "pending" or prompt.revision != setting.revision:
-        await message.answer("Этот запрос времени уже обработан или устарел. Откройте /settings.")
+        await _answer_text(
+            message, "Этот запрос времени уже обработан или устарел. Откройте /settings."
+        )
         return
     if edited:
-        await message.answer(
-            "Изменённое сообщение не применено. Отправьте новое время ответом на запрос."
+        await _answer_text(
+            message, "Изменённое сообщение не применено. Отправьте новое время ответом на запрос."
         )
         return
 
     value_text = (message.text or "").strip()
     if _TIME_PATTERN.fullmatch(value_text) is None:
-        await message.answer("Введите время строго в формате ЧЧ:ММ, например 19:30.")
+        await _answer_text(message, "Введите время строго в формате ЧЧ:ММ, например 19:30.")
         return
     hour_text, minute_text = value_text.split(":")
     value = time(int(hour_text), int(minute_text))
@@ -140,9 +163,11 @@ async def _handle_time_reply(message: Message, store: Store, *, edited: bool) ->
             message.chat.id, reply.message_id, value
         )
     if updated is None:
-        await message.answer("Этот запрос времени уже обработан или устарел. Откройте /settings.")
+        await _answer_text(
+            message, "Этот запрос времени уже обработан или устарел. Откройте /settings."
+        )
         return
-    await message.answer(_settings_text(updated))
+    await _answer_text(message, _settings_text(updated))
 
 
 async def settings_time_reply_handler(message: Message, store: Store) -> None:

@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot
 
 from .config import Settings
+from .formatting import entities_for_text
 from .models import PublicationChangeNotification, SchedulerNotice, WeeklyPublicationSetting
 from .publishing import publish_week
 from .storage import Store
@@ -82,6 +83,8 @@ async def _deliver_scheduler_notices(settings: Settings, store: Store, bot: Bot)
             await bot.send_message(
                 settings.telegram_owner_id,
                 notice.text,
+                entities=entities_for_text(notice.text, heading_lines=(0,)),
+                parse_mode=None,
                 disable_web_page_preview=True,
             )
         except asyncio.CancelledError:
@@ -96,10 +99,11 @@ async def _deliver_scheduler_notices(settings: Settings, store: Store, bot: Bot)
 async def _deliver_publication_notifications(settings: Settings, store: Store, bot: Bot) -> None:
     while (notification := await store.claim_next_publication_notification()) is not None:
         try:
-            for chunk in _split_text(notification.text, 4096):
+            for index, chunk in enumerate(_split_text(notification.text, 4096)):
                 await bot.send_message(
                     settings.telegram_owner_id,
                     chunk,
+                    entities=entities_for_text(chunk, heading_lines=(0,) if index == 0 else ()),
                     parse_mode=None,
                     disable_web_page_preview=True,
                 )
@@ -159,7 +163,9 @@ async def _check_schedule(
                 await store.save_scheduler_notice(
                     week_start,
                     "empty",
-                    f"На неделю с {week_start:%d.%m.%Y} записей нет; публикация не отправлена.",
+                    "📅 Публикация не выполнена\n"
+                    f"Неделя: {week_start:%d.%m.%Y}\n"
+                    "Причина: на эту неделю записей нет.",
                     setting_revision=setting.revision,
                 )
             else:
@@ -168,8 +174,9 @@ async def _check_schedule(
             await store.save_scheduler_notice(
                 week_start,
                 "missed",
-                f"Пропущено время автопубликации недели с {week_start:%d.%m.%Y}. "
-                "Автоматическая отправка не выполнялась; проверьте выпуск командой /publish.",
+                "⏰ Время публикации пропущено\n"
+                f"Неделя: {week_start:%d.%m.%Y}\n"
+                "Автоматическая отправка не выполнена. Проверьте выпуск командой /publish.",
                 setting_revision=setting.revision,
             )
 

@@ -92,7 +92,9 @@ class RecordsStorage(StorageBase):
                     (record_id,),
                 ).fetchone()
                 if current_draft is None or current_draft["id"] != expected_draft_id:
-                    raise ValueError("Черновик изменился до сохранения правки.")
+                    raise ValueError(
+                        "Карточка изменилась. Откройте /events и начните исправление заново."
+                    )
 
             if record_id is None:
                 if base_revision is not None:
@@ -118,7 +120,9 @@ class RecordsStorage(StorageBase):
                     raise ValueError("Изменяйте регулярное занятие через датированное расписание.")
                 expected_revision = record["revision"] if record["status"] == "active" else None
                 if expected_revision != base_revision:
-                    raise ValueError("Черновик основан на устаревшей ревизии.")
+                    raise ValueError(
+                        "Карточка изменилась. Откройте /events и начните действие заново."
+                    )
                 version_row = connection.execute(
                     "SELECT COALESCE(MAX(version), 0) + 1 FROM drafts WHERE record_id = ?",
                     (record_id,),
@@ -165,7 +169,7 @@ class RecordsStorage(StorageBase):
             if draft is None:
                 raise ValueError("Неизвестный черновик.")
             if draft["version"] != version:
-                raise ValueError("Версия черновика устарела.")
+                raise ValueError("Карточка изменилась. Откройте /events и начните действие заново.")
             record = connection.execute(
                 "SELECT * FROM records WHERE id = ?", (draft["record_id"],)
             ).fetchone()
@@ -203,7 +207,9 @@ class RecordsStorage(StorageBase):
                 new_revision = 1
             elif record["status"] == "active":
                 if draft["base_revision"] != record["revision"]:
-                    raise ValueError("Черновик основан на устаревшей ревизии.")
+                    raise ValueError(
+                        "Карточка изменилась. Откройте /events и начните действие заново."
+                    )
                 new_revision = record["revision"] + 1
             else:
                 raise ValueError("Нельзя подтвердить черновик отменённой записи.")
@@ -224,7 +230,7 @@ class RecordsStorage(StorageBase):
                 ),
             )
             if update.rowcount != 1:
-                raise ValueError("Запись изменилась до подтверждения черновика.")
+                raise ValueError("Карточка изменилась. Откройте /events и начните действие заново.")
             confirmed = connection.execute(
                 "UPDATE drafts SET status = 'confirmed' WHERE id = ? AND status = 'pending'",
                 (draft_id,),
@@ -264,7 +270,7 @@ class RecordsStorage(StorageBase):
             if draft is None:
                 raise ValueError("Неизвестный черновик.")
             if draft["version"] != version:
-                raise ValueError("Версия черновика устарела.")
+                raise ValueError("Карточка изменилась. Откройте /events и начните действие заново.")
             if draft["status"] == "rejected":
                 return
             if draft["status"] != "pending":
@@ -290,7 +296,7 @@ class RecordsStorage(StorageBase):
             if record["data_type"] == "class":
                 raise ValueError("Регулярное занятие завершайте через управление расписанием.")
             if record["revision"] != revision:
-                raise ValueError("Ревизия записи устарела.")
+                raise ValueError("Карточка изменилась. Откройте /events и начните действие заново.")
             before_snapshot = capture_weekly_snapshot(connection)
             updated = connection.execute(
                 "UPDATE records SET revision = revision + 1, status = 'cancelled' "
@@ -298,7 +304,7 @@ class RecordsStorage(StorageBase):
                 (record_id, revision),
             )
             if updated.rowcount != 1:
-                raise ValueError("Запись изменилась до отмены.")
+                raise ValueError("Карточка изменилась. Откройте /events и начните действие заново.")
             connection.execute(
                 "UPDATE drafts SET status = 'superseded' "
                 "WHERE record_id = ? AND status = 'pending'",

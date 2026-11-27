@@ -26,6 +26,9 @@ class SourcesStorage(StorageBase):
     async def set_source_error(self, source_id: int, reason: str) -> None:
         await asyncio.to_thread(self._set_source_error_sync, source_id, reason)
 
+    async def reject_source(self, source_id: int, reason: str) -> None:
+        await asyncio.to_thread(self._reject_source_sync, source_id, reason)
+
     async def retry_source(self, source_id: int) -> Source:
         return await asyncio.to_thread(self._retry_source_sync, source_id)
 
@@ -89,6 +92,19 @@ class SourcesStorage(StorageBase):
                 "UPDATE sources SET status = 'failed', error_reason = ?, "
                 "attachment_status = CASE WHEN attachment_status = 'pending' THEN 'failed' "
                 "ELSE attachment_status END WHERE id = ?",
+                (reason, source_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("Неизвестный источник.")
+
+    def _reject_source_sync(self, source_id: int, reason: str) -> None:
+        with self._transaction() as connection:
+            updated = connection.execute(
+                "UPDATE sources SET status = 'processed', error_reason = ?, "
+                "attachment_status = CASE "
+                "WHEN poster_path IS NOT NULL THEN 'saved' "
+                "WHEN attachment_status = 'removed' THEN 'removed' "
+                "ELSE 'none' END WHERE id = ?",
                 (reason, source_id),
             )
             if updated.rowcount != 1:

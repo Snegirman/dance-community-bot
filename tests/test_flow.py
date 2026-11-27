@@ -529,7 +529,8 @@ def test_invalid_template_and_duplicate_content_keep_distinct_sources(
         invalid_source = await store.get_source(OWNER_ID, 1)
         assert invalid_source is not None
         assert invalid_source.text == invalid
-        assert invalid_source.status == "failed"
+        assert invalid_source.status == "processed"
+        assert invalid_source.attachment_status == "none"
         assert invalid_source.error_reason is not None
         assert await store.list_drafts() == []
 
@@ -1234,7 +1235,7 @@ def test_settings_commands_work_before_start_and_preserve_changes_after_restart(
             bot,
             message_update(bot, update_id=6, message_id=4, text="/settings"),
         )
-        assert "автопубликация отключена" in button_request(session, "Изменить время").text
+        assert "Автопубликация: отключена" in button_request(session, "Изменить время").text
         await stop_app(dispatcher, bot)
 
     asyncio.run(scenario())

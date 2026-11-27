@@ -6,8 +6,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
-from aiogram.methods import SendMessage
-from aiogram.types import Chat, Message, User
+from aiogram.methods import SendMessage, SendPhoto
+from aiogram.types import Chat, FSInputFile, Message, User
 from telegram_transport import RecordingSession
 
 from dance_community_bot.cards import (
@@ -482,6 +482,97 @@ def test_confirmed_record_has_explicit_edit_and_poster_removal_actions(tmp_path:
         removal = next(action for action in actions if action and action.action == "remove_poster")
         assert removal.source_id == source.id
 
+        await bot.session.close()
+
+    asyncio.run(scenario())
+
+
+def test_open_record_with_poster_keeps_full_emoji_text_bindings_and_actions(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        session = RecordingSession(CHAT_ID)
+        bot = Bot(token=TOKEN, session=session)
+        store = Store(tmp_path / "dance.sqlite3")
+        await store.initialize()
+        source = await store.save_source(
+            SourceInput(
+                chat_id=CHAT_ID,
+                message_id=17,
+                text="личный источник не показывается",
+                received_at=datetime(2026, 11, 7, 12, 0, tzinfo=UTC),
+                telegram_file_id="poster-file",
+                is_photo=True,
+            )
+        )
+        poster_path = Path("posters") / "card.jpg"
+        (store.path.parent / poster_path).parent.mkdir(parents=True, exist_ok=True)
+        (store.path.parent / poster_path).write_bytes(b"poster")
+        await store.set_source_poster_path(source.id, poster_path)
+        description = "🪩<>&" * 1400 + " конец 🩰"
+        draft = await store.save_draft(
+            source.id,
+            EventData(
+                title="Джем 🪩 <>&",
+                event_type="Встреча",
+                start_date=date(2026, 12, 14),
+                start_time=time(18, 30),
+                place="Зал <>&",
+                price="Вход 🪩 <>&",
+                description=description,
+            ),
+            poster_source_id=source.id,
+        )
+        record = await store.confirm_draft(draft.id, draft.version)
+        message = Message(
+            message_id=18,
+            date=datetime(2026, 11, 7, 12, 0, tzinfo=UTC),
+            chat=Chat(id=CHAT_ID, type="private"),
+            from_user=User(id=CHAT_ID, is_bot=False, first_name="Владелец"),
+        ).as_(bot)
+
+        await show_record(message, record, store, with_poster=True)
+
+        photos = [request for request in session.requests if isinstance(request, SendPhoto)]
+        texts = [request for request in session.requests if isinstance(request, SendMessage)]
+        assert len(photos) == 1
+        assert photos[0].caption is None
+        assert isinstance(photos[0].photo, FSInputFile)
+        assert photos[0].photo.path.resolve() == (store.path.parent / poster_path).resolve()
+        assert len(texts) >= 2
+        delivered = "".join(request.text for request in texts)
+        assert description in delivered
+        assert "Джем 🪩 <>&" in delivered
+        assert "Зал <>&" in delivered
+        assert "Вход 🪩 <>&" in delivered
+        assert "личный источник не показывается" not in delivered
+        assert "ревизия" not in delivered.casefold()
+        assert "версия" not in delivered.casefold()
+        assert all(request.parse_mode is None for request in texts)
+        assert any(request.entities for request in texts)
+        assert all(len(request.text.encode("utf-16-le")) // 2 <= 4096 for request in texts)
+
+        bound_ids = [101, *range(102, 102 + len(texts))]
+        for message_id in bound_ids:
+            binding = await store.get_card_binding(CHAT_ID, message_id)
+            assert binding is not None and binding.record_id == record.id
+
+        final_text = texts[-1]
+        assert final_text.reply_markup is not None
+        callbacks = [
+            button.callback_data
+            for row in final_text.reply_markup.inline_keyboard
+            for button in row
+            if button.callback_data is not None
+        ]
+        actions = [
+            await store.get_card_action(callback.removeprefix("a:")) for callback in callbacks
+        ]
+        assert {action.action for action in actions if action is not None} == {
+            "edit",
+            "cancel",
+            "remove_poster",
+        }
         await bot.session.close()
 
     asyncio.run(scenario())

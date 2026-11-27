@@ -8,12 +8,19 @@ from typing import Literal
 
 import pytest
 from aiogram import Bot
+from aiogram.enums import MessageEntityType
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.methods import GetChat, SendMessage, SendPhoto, TelegramMethod
 from aiogram.methods.base import TelegramType
 from telegram_transport import RecordingSession
 
-from dance_community_bot.models import EventData, PublicationClaimResult, SourceInput, WeeklyPost
+from dance_community_bot.models import (
+    EventData,
+    PublicationClaimResult,
+    SourceInput,
+    TextPostPart,
+    WeeklyPost,
+)
 from dance_community_bot.publishing import publish_week
 from dance_community_bot.storage import Store
 from dance_community_bot.weekly import build_weekly_post
@@ -104,7 +111,9 @@ async def prepare_event(store: Store, *, photo: bool = False) -> None:
 
 
 @pytest.mark.parametrize("photo", [False, True])
-def test_publication_escapes_html_in_text_and_caption(tmp_path: Path, photo: bool) -> None:
+def test_publication_sends_plain_text_with_entities_for_html_characters(
+    tmp_path: Path, photo: bool
+) -> None:
     async def scenario() -> None:
         store = Store(tmp_path / "dance.sqlite3")
         await prepare_event(store, photo=photo)
@@ -113,10 +122,55 @@ def test_publication_escapes_html_in_text_and_caption(tmp_path: Path, photo: boo
         async with Bot(TOKEN, session=session) as bot:
             result = await publish_week(post, GROUP_ID, store, bot)
         assert result.status == "delivered"
-        body = session.photo_requests[0].caption if photo else session.messages[0]
+        if photo:
+            request = session.photo_requests[0]
+            body = request.caption
+            entities = request.caption_entities
+            parse_mode = request.parse_mode
+        else:
+            request = next(
+                request for request in session.requests if isinstance(request, SendMessage)
+            )
+            body = request.text
+            entities = request.entities
+            parse_mode = request.parse_mode
         assert body is not None
-        assert "&lt;Jam&gt;&amp;" in body
-        assert "<Jam>" not in body
+        assert "<Jam>&" in body
+        assert "&lt;Jam&gt;" not in body
+        assert parse_mode is None
+        assert entities is not None
+        assert any(entity.type == MessageEntityType.BOLD for entity in entities)
+
+    asyncio.run(scenario())
+
+
+def test_publication_formats_legacy_section_heading_without_changing_snapshot(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store = Store(tmp_path / "dance.sqlite3")
+        await prepare_event(store)
+        generated = await build_weekly_post(date(2026, 11, 9), store)
+        text = next(part.text for part in generated.parts if isinstance(part, TextPostPart))
+        legacy_text = text.replace("🎟 События", "События", 1)
+        legacy_post = generated.model_copy(update={"parts": (TextPostPart(text=legacy_text),)})
+        session = RegressionSession()
+
+        async with Bot(TOKEN, session=session) as bot:
+            result = await publish_week(legacy_post, GROUP_ID, store, bot)
+
+        request = next(request for request in session.requests if isinstance(request, SendMessage))
+        assert result.publication_id is not None
+        publication = await store.get_publication(result.publication_id)
+
+        assert result.status == "delivered"
+        assert request.text == legacy_text
+        assert request.parse_mode is None
+        assert request.entities
+        assert request.entities[0].offset == 0
+        assert request.entities[0].length == len("События")
+        assert publication is not None
+        assert publication.snapshot.parts[0].text == legacy_text
 
     asyncio.run(scenario())
 

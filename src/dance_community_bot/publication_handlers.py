@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, datetime
-from html import escape
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
-from aiogram.enums import ParseMode
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -19,6 +17,7 @@ from aiogram.types import (
 
 from .access import is_owner_private
 from .config import Settings
+from .formatting import entities_for_text
 from .models import (
     PublicationState,
     TextPostPart,
@@ -33,9 +32,30 @@ from .publishing import (
 )
 from .storage import Store
 from .templates import parse_strict_date
-from .weekly import WeeklyRangeError, _split_text, build_weekly_post, week_bounds
+from .weekly import (
+    _SECTION_HEADINGS,
+    WeeklyRangeError,
+    _split_text,
+    build_weekly_post,
+    week_bounds,
+)
 
 _MOSCOW = ZoneInfo("Europe/Moscow")
+
+
+async def _answer_text(
+    target: Message,
+    text: str,
+    *,
+    heading_lines: tuple[int, ...] = (0,),
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> Message:
+    return await target.answer(
+        text,
+        entities=entities_for_text(text, heading_lines=heading_lines),
+        parse_mode=None,
+        reply_markup=reply_markup,
+    )
 
 
 def _selected_week(message: Message) -> date:
@@ -56,21 +76,25 @@ def _selected_week(message: Message) -> date:
 async def _send_preview(target: Message, post: WeeklyPost, store: Store) -> bool:
     for part in post.parts:
         if isinstance(part, TextPostPart):
-            await target.answer(escape(part.text), parse_mode=ParseMode.HTML)
+            first_line = part.text.partition("\n")[0]
+            heading_lines = (0,) if first_line in _SECTION_HEADINGS else ()
+            await _answer_text(target, part.text, heading_lines=heading_lines)
             continue
 
         poster_path = store.path.parent / part.poster_path
         try:
             photo_bytes = await asyncio.to_thread(poster_path.read_bytes)
         except OSError:
-            await target.answer(
-                "Не удалось прочитать афишу для предпросмотра. Публикация не подготовлена."
+            await _answer_text(
+                target, "Не удалось прочитать афишу для предпросмотра. Публикация не подготовлена."
             )
             return False
+        caption = part.caption
         await target.answer_photo(
             BufferedInputFile(photo_bytes, filename=poster_path.name),
-            caption=escape(part.caption),
-            parse_mode=ParseMode.HTML,
+            caption=caption,
+            caption_entities=entities_for_text(caption, heading_lines=(0,)),
+            parse_mode=None,
         )
     return True
 
@@ -91,38 +115,40 @@ def _publication_text(publication: PublicationState) -> str:
         "delivered": "доставлен",
     }
     title = (
-        "Повтор актуального выпуска" if publication.source_publication_id is not None else "Выпуск"
+        "🔁 Повтор актуального выпуска"
+        if publication.source_publication_id is not None
+        else "📣 Выпуск"
     )
     lines = [
-        f"{title} недели с {publication.week_start:%d.%m.%Y}: "
-        f"{publication_statuses[publication.status]}.",
-        f"Группа: {publication.group_id}.",
-        "Части: "
-        + ", ".join(
-            f"{part.index + 1} — {statuses[part.status]}"
-            + (f" (сообщение {part.message_id})" if part.message_id is not None else "")
-            for part in publication.parts
-        ),
+        title,
+        f"Неделя: {publication.week_start:%d.%m.%Y}.",
+        f"Статус: {publication_statuses[publication.status]}.",
+        f"Целевая группа: {publication.group_id}.",
     ]
     if publication.status == "prepared":
         if publication.source_publication_id is not None:
-            lines[0] = (
-                f"Актуальный предпросмотр недели с {publication.week_start:%d.%m.%Y}. "
-                "Подтвердить повторную отправку?"
-            )
+            lines[2] = "Статус: готов к повторной отправке."
+            lines.append("Подтвердить повторную отправку?")
             lines.append(
                 "Если каталог изменится до отправки, предпросмотр обновится и потребуется "
                 "новое подтверждение."
             )
         else:
-            lines[0] = f"Предпросмотр недели с {publication.week_start:%d.%m.%Y}. Опубликовать?"
-    elif publication.status == "unknown":
+            lines[2] = "Статус: готов к публикации."
+            lines.append("Опубликовать этот выпуск?")
+    else:
         lines.append(
-            "Проверьте группу перед выбором: возможна доставка части. "
-            "Повтор может создать дубль. Будет повторена только выбранная часть."
+            "Части: "
+            + ", ".join(f"{part.index + 1} — {statuses[part.status]}" for part in publication.parts)
+            + "."
+        )
+    if publication.status == "unknown":
+        lines.append(
+            "⚠️ Доставка некоторых частей неизвестна. Проверьте группу: отправка могла пройти, "
+            "а повтор может создать дубль."
         )
     elif publication.status == "delivered":
-        lines.append("Для нового повтора текущей недели используйте /republish.")
+        lines.append("Следующий шаг: чтобы повторить актуальный выпуск, используйте /republish.")
     return "\n".join(lines)
 
 
@@ -204,10 +230,12 @@ async def _send_bound_status(
 ) -> PublicationState | None:
     next_revision = publication.preview_revision + 1
     chunks = _split_text(_publication_text(publication), 4096)
-    for chunk in chunks[:-1]:
-        await target.answer(chunk)
-    status_message = await target.answer(
+    for index, chunk in enumerate(chunks[:-1]):
+        await _answer_text(target, chunk, heading_lines=(0,) if index == 0 else ())
+    status_message = await _answer_text(
+        target,
         chunks[-1],
+        heading_lines=(0,) if len(chunks) == 1 else (),
         reply_markup=_publication_keyboard(publication, next_revision),
     )
     return await store.bind_publication_message(
@@ -227,7 +255,7 @@ async def _prepare_preview(
     for attempt in range(3):
         post = await build_weekly_post(week_start, store)
         if not post.records and not post.occurrences:
-            await target.answer("На эту неделю записей нет.")
+            await _answer_text(target, "На эту неделю записей нет.")
             return
         if not await _send_preview(target, post, store):
             return
@@ -245,7 +273,9 @@ async def _prepare_preview(
             await _send_bound_status(target, store, result.publication)
             return
         if attempt == 2:
-            await target.answer("Данные меняются во время предпросмотра. Повторите /publish позже.")
+            await _answer_text(
+                target, "Данные меняются во время предпросмотра. Повторите /publish позже."
+            )
 
 
 async def publish_command_handler(
@@ -255,12 +285,14 @@ async def publish_command_handler(
 ) -> None:
     """Показать снимок недели и запросить отдельное подтверждение отправки."""
     if settings.telegram_group_id is None:
-        await message.answer("Для публикации настройте TELEGRAM_GROUP_ID группы или супергруппы.")
+        await _answer_text(
+            message, "Для публикации настройте TELEGRAM_GROUP_ID группы или супергруппы."
+        )
         return
     try:
         week_start = _selected_week(message)
     except (ValueError, WeeklyRangeError) as error:
-        await message.answer(str(error))
+        await _answer_text(message, str(error))
         return
 
     existing = await store.get_publication_for_week(settings.telegram_group_id, week_start)
@@ -291,17 +323,18 @@ async def _prepare_republication_preview(
         if result.outcome == "stale":
             post = await build_weekly_post(post.week_start, store)
             if not post.records and not post.occurrences:
-                await target.answer("На эту неделю записей нет. Повтор не подготовлен.")
+                await _answer_text(target, "На эту неделю записей нет. Повтор не подготовлен.")
                 return
             continue
         if result.outcome == "missing":
-            await target.answer(
-                "Нет полностью доставленного выпуска за эту неделю. Сначала выполните /publish."
+            await _answer_text(
+                target,
+                "Нет полностью доставленного выпуска за эту неделю. Сначала выполните /publish.",
             )
             return
         publication = result.publication
         if publication is None:
-            await target.answer("Не удалось подготовить повтор. Повторите /republish позже.")
+            await _answer_text(target, "Не удалось подготовить повтор. Повторите /republish позже.")
             return
         if publication.status == "prepared" and not await _send_preview(
             target, publication.snapshot, store
@@ -309,7 +342,9 @@ async def _prepare_republication_preview(
             return
         await _send_bound_status(target, store, publication)
         return
-    await target.answer("Данные меняются во время предпросмотра. Повторите /republish позже.")
+    await _answer_text(
+        target, "Данные меняются во время предпросмотра. Повторите /republish позже."
+    )
 
 
 async def republish_command_handler(
@@ -320,7 +355,7 @@ async def republish_command_handler(
     """Подготовить актуальный снимок недели для повторной отправки."""
     command_parts = (message.text or "").split(maxsplit=1)
     if len(command_parts) == 2 and command_parts[1].strip():
-        await message.answer("Команда /republish не принимает дату.")
+        await _answer_text(message, "Команда /republish не принимает дату.")
         return
 
     bound = await store.get_republication_for_request(message.chat.id, message.message_id)
@@ -336,22 +371,25 @@ async def republish_command_handler(
             return
         post = await build_weekly_post(bound.week_start, store)
         if not post.records and not post.occurrences:
-            await message.answer("На эту неделю записей нет. Повтор не подготовлен.")
+            await _answer_text(message, "На эту неделю записей нет. Повтор не подготовлен.")
             return
         original = await store.get_publication(bound.source_publication_id)
         if original is None:
-            await message.answer("Исходный выпуск недоступен. Повторите /publish.")
+            await _answer_text(message, "Исходный выпуск недоступен. Повторите /publish.")
             return
         await _prepare_republication_preview(message, store, original, post)
         return
 
     if settings.telegram_group_id is None:
-        await message.answer("Для публикации настройте TELEGRAM_GROUP_ID группы или супергруппы.")
+        await _answer_text(
+            message, "Для публикации настройте TELEGRAM_GROUP_ID группы или супергруппы."
+        )
         return
     original = await store.get_publication_for_week(settings.telegram_group_id, current_week)
     if original is None or original.status != "delivered":
-        await message.answer(
-            "Нет полностью доставленного выпуска за текущую неделю. Сначала выполните /publish."
+        await _answer_text(
+            message,
+            "Нет полностью доставленного выпуска за текущую неделю. Сначала выполните /publish.",
         )
         return
 
@@ -368,7 +406,7 @@ async def republish_command_handler(
     if not post.records and not post.occurrences:
         if pending is not None:
             await store.bind_republication_request(pending.id, message.chat.id, message.message_id)
-        await message.answer("На эту неделю записей нет. Повтор не подготовлен.")
+        await _answer_text(message, "На эту неделю записей нет. Повтор не подготовлен.")
         return
     await _prepare_republication_preview(message, store, original, post)
 
@@ -402,7 +440,7 @@ async def _refresh_callback_status(
     if not isinstance(message, Message):
         return
     if publication is None:
-        await message.answer("Состояние выпуска недоступно.")
+        await _answer_text(message, "Состояние выпуска недоступно.")
         return
     await _send_bound_status(message, store, publication)
 
@@ -415,7 +453,7 @@ async def _refresh_republication_callback(
     for _ in range(3):
         post = await build_weekly_post(publication.week_start, store)
         if not post.records and not post.occurrences:
-            await target.answer("На эту неделю записей нет. Повторная отправка не началась.")
+            await _answer_text(target, "На эту неделю записей нет. Повторная отправка не началась.")
             return
         result = await store.refresh_republication(
             post, publication.id, publication.preview_revision
@@ -424,7 +462,7 @@ async def _refresh_republication_callback(
             continue
         updated = result.publication
         if updated is None:
-            await target.answer("Не удалось обновить повторный выпуск. Откройте /republish.")
+            await _answer_text(target, "Не удалось обновить повторный выпуск. Откройте /republish.")
             return
         if updated.status == "prepared" and not await _send_preview(
             target, updated.snapshot, store
@@ -432,7 +470,9 @@ async def _refresh_republication_callback(
             return
         await _send_bound_status(target, store, updated)
         return
-    await target.answer("Данные меняются. Повторите /republish и подтвердите новый предпросмотр.")
+    await _answer_text(
+        target, "Данные меняются. Повторите /republish и подтвердите новый предпросмотр."
+    )
 
 
 async def publication_callback_handler(
@@ -561,13 +601,16 @@ async def publication_callback_handler(
         if publication.source_publication_id is not None:
             await _refresh_republication_callback(message, store, publication)
             return
-        await message.answer("Данные изменились после предпросмотра. Проверьте новый выпуск.")
+        await _answer_text(
+            message, "Данные изменились после предпросмотра. Проверьте новый выпуск."
+        )
         await _prepare_preview(message, store, publication.group_id, publication.week_start)
         return
     if result is not None and result.status == "rejected":
         command = "/republish" if publication.source_publication_id is not None else "/publish"
-        await message.answer(
+        await _answer_text(
+            message,
             "Отправка не началась. Проверьте TELEGRAM_GROUP_ID, доступ бота к группе "
-            f"или супергруппе и откройте актуальные кнопки через {command}."
+            f"или супергруппе и откройте актуальные кнопки через {command}.",
         )
     await _refresh_callback_status(callback, store, updated)

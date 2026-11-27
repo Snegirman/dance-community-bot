@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import hashlib
-import html
 import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from aiogram.enums import ParseMode
 from aiogram.types import FSInputFile, Message
 
+from .formatting import entities_for_text
 from .models import (
     EventData,
     Occurrence,
@@ -30,6 +29,7 @@ from .templates import parse_strict_date
 _MOSCOW = ZoneInfo("Europe/Moscow")
 _TEXT_LIMIT = 4096
 _CAPTION_LIMIT = 1024
+_SECTION_HEADINGS = ("🩰 Занятия", "🎟 События", "Занятия", "События")
 
 
 class WeeklyRangeError(ValueError):
@@ -222,7 +222,7 @@ def build_weekly_post_from_snapshot(
     if occurrences:
         parts.extend(
             _section_parts(
-                "Занятия",
+                "🩰 Занятия",
                 [
                     (_occurrence_text(occurrence), occurrence.poster_source_id)
                     for occurrence in occurrences
@@ -233,7 +233,7 @@ def build_weekly_post_from_snapshot(
     if events:
         parts.extend(
             _section_parts(
-                "События",
+                "🎟 События",
                 [
                     (
                         _event_text(data),
@@ -273,7 +273,10 @@ async def preview_command_handler(message: Message, store: Store) -> None:
                 invalid_error="Такой календарной даты не существует.",
             )
         except ValueError as error:
-            await message.answer(str(error))
+            text = str(error)
+            await message.answer(
+                text, entities=entities_for_text(text, heading_lines=(0,)), parse_mode=None
+            )
             return
     else:
         selected_date = datetime.now(_MOSCOW).date()
@@ -282,19 +285,33 @@ async def preview_command_handler(message: Message, store: Store) -> None:
         week_start = week_bounds(selected_date)[0].date()
         post = await build_weekly_post(week_start, store)
     except WeeklyRangeError as error:
-        await message.answer(str(error))
+        text = str(error)
+        await message.answer(
+            text, entities=entities_for_text(text, heading_lines=(0,)), parse_mode=None
+        )
         return
 
     if not post.records and not post.occurrences:
-        await message.answer("На эту неделю записей нет.")
+        text = "На эту неделю записей нет."
+        await message.answer(
+            text, entities=entities_for_text(text, heading_lines=(0,)), parse_mode=None
+        )
         return
 
     for part in post.parts:
         if isinstance(part, TextPostPart):
-            await message.answer(html.escape(part.text), parse_mode=ParseMode.HTML)
+            first_line = part.text.partition("\n")[0]
+            heading_lines = (0,) if first_line in _SECTION_HEADINGS else ()
+            await message.answer(
+                part.text,
+                entities=entities_for_text(part.text, heading_lines=heading_lines),
+                parse_mode=None,
+            )
         else:
+            caption = part.caption
             await message.answer_photo(
                 FSInputFile(store.path.parent / part.poster_path),
-                caption=html.escape(part.caption),
-                parse_mode=ParseMode.HTML,
+                caption=caption,
+                caption_entities=entities_for_text(caption, heading_lines=(0,)),
+                parse_mode=None,
             )

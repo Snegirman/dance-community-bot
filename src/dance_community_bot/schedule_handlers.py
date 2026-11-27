@@ -12,7 +12,8 @@ from aiogram.types import (
     Message,
 )
 
-from .cards import _send_bound_text, format_card, show_source
+from .cards import _answer_chunks, _send_bound_text, format_card
+from .formatting import entities_for_text
 from .models import (
     CancelOccurrence,
     CardAction,
@@ -156,13 +157,15 @@ async def show_schedule_week(message: Message, store: Store, week_start: date) -
     try:
         occurrences = _management_occurrences(versions, exceptions, week_start)
     except ValueError as error:
-        await message.answer(str(error))
+        await _answer_chunks(message, str(error))
         return
 
     last_weekday = date.fromordinal(week_start.toordinal() + 6)
-    await message.answer(f"Расписание · {_date_label(week_start)} — {_date_label(last_weekday)}")
+    await _answer_chunks(
+        message, f"Расписание · {_date_label(week_start)} — {_date_label(last_weekday)}"
+    )
     if not versions:
-        await message.answer("Регулярных занятий пока нет.")
+        await _answer_chunks(message, "Регулярных занятий пока нет.")
         for draft in await store.list_pending_schedule_changes():
             await _schedule_draft_preview(message, draft, store)
         return
@@ -175,7 +178,7 @@ async def show_schedule_week(message: Message, store: Store, week_start: date) -
         if record is None:
             continue
         schedule_revision = record.revision
-        lines = [f"Серия №{series_id} · ревизия {schedule_revision}"]
+        lines = [f"Серия №{series_id}"]
         for version in sorted(series_versions, key=lambda item: item.revision):
             end_label = (
                 _date_label(date.fromordinal(version.effective_until.toordinal() - 1))
@@ -183,7 +186,7 @@ async def show_schedule_week(message: Message, store: Store, week_start: date) -
                 else "без окончания"
             )
             lines.append(
-                f"\nВерсия {version.revision} · действует "
+                f"\nДействует "
                 f"{_date_label(version.effective_from)} — {end_label}\n"
                 f"{format_card(version.data)}"
             )
@@ -274,7 +277,7 @@ async def show_schedule_week(message: Message, store: Store, week_start: date) -
             keyboard=keyboard,
         )
     if not occurrences:
-        await message.answer("На этой неделе нет регулярных проведений.")
+        await _answer_chunks(message, "На этой неделе нет регулярных проведений.")
     for draft in await store.list_pending_schedule_changes():
         await _schedule_draft_preview(message, draft, store)
 
@@ -290,7 +293,7 @@ async def schedule_command_handler(message: Message, store: Store) -> None:
         else:
             raise ValueError("Используйте /schedule или /schedule ДД.ММ.ГГГГ.")
     except ValueError as error:
-        await message.answer(str(error))
+        await _answer_chunks(message, str(error))
         return
     week_start = date.fromordinal(selected_date.toordinal() - selected_date.weekday())
     await show_schedule_week(message, store, week_start)
@@ -334,6 +337,127 @@ def _parse_effective_date(text: str) -> date:
     if not separator or label.strip().casefold() != "действует с":
         raise ValueError("Укажите «Действует с: ДД.ММ.ГГГГ».")
     return parse_schedule_date(raw_date.strip())
+
+
+async def _parse_schedule_change(
+    source: Source,
+    binding: CardBinding,
+    store: Store,
+    poster_source_id: int | None,
+) -> ScheduleChange:
+    if source.is_photo and binding.schedule_action in {"transfer_occurrence", "end_series"}:
+        instruction = (
+            "Для переноса занятия отправьте дату и время без фото."
+            if binding.schedule_action == "transfer_occurrence"
+            else "Для завершения серии отправьте последнюю дату без фото."
+        )
+        raise ValueError(instruction)
+    if binding.schedule_series_id is None or binding.schedule_revision is None:
+        raise ValueError("Приглашение для изменения расписания повреждено.")
+    record = await store.get_record(binding.schedule_series_id)
+    if record is None or record.status != "active" or not isinstance(record.data, ClassData):
+        raise ValueError("Неизвестная или неактивная серия занятий.")
+    if record.revision != binding.schedule_revision:
+        raise ValueError("Расписание изменилось. Откройте /schedule и повторите действие.")
+
+    if binding.schedule_action == "transfer_occurrence":
+        if binding.schedule_original_date is None:
+            raise ValueError("Приглашение для переноса не содержит исходную дату.")
+        new_date, new_time, place = _parse_transfer_text(source.text or "")
+        return TransferOccurrence(
+            action="transfer_occurrence",
+            series_id=binding.schedule_series_id,
+            expected_revision=binding.schedule_revision,
+            expected_exception_revision=binding.expected_exception_revision,
+            original_date=binding.schedule_original_date,
+            new_date=new_date,
+            new_time=new_time,
+            place=place,
+            source_id=source.id,
+        )
+
+    if binding.schedule_action == "change_series":
+        effective_from, data = _parse_series_text(source.text or "")
+        today = datetime.now(_MOSCOW).date()
+        tomorrow = date.fromordinal(today.toordinal() + 1)
+        if effective_from < tomorrow:
+            raise ValueError("Новое расписание может действовать не раньше завтрашнего дня.")
+        if data.first_date < effective_from:
+            raise ValueError("Первая дата занятия не может быть раньше даты начала действия.")
+        return ChangeSeries(
+            action="change_series",
+            series_id=binding.schedule_series_id,
+            expected_revision=binding.schedule_revision,
+            effective_from=effective_from,
+            data=data,
+            source_id=source.id,
+            poster_source_id=poster_source_id,
+        )
+
+    if binding.schedule_action == "remove_poster":
+        if source.is_photo:
+            raise ValueError("Для снятия афиши отправьте только дату текстом.")
+        effective_from = _parse_effective_date(source.text or "")
+        versions, _ = await store.get_schedule()
+        version = _version_on_date(versions, binding.schedule_series_id, effective_from)
+        if version is None:
+            raise ValueError("На эту дату у серии нет действующего расписания.")
+        data = _next_rule_data(version.data, effective_from)
+        if version.effective_until is not None:
+            last_date = date.fromordinal(version.effective_until.toordinal() - 1)
+            if data.last_date is None or last_date < data.last_date:
+                if data.first_date > last_date:
+                    raise ValueError("На эту дату у серии уже не осталось регулярных проведений.")
+                data = data.model_copy(update={"last_date": last_date})
+        return ChangeSeries(
+            action="change_series",
+            series_id=binding.schedule_series_id,
+            expected_revision=binding.schedule_revision,
+            effective_from=effective_from,
+            data=data,
+            source_id=source.id,
+            remove_poster=True,
+        )
+
+    if binding.schedule_action == "end_series":
+        if source.text is None:
+            raise ValueError("Отправьте последнюю дату в формате ДД.ММ.ГГГГ.")
+        last_date = parse_schedule_date(source.text.strip())
+        return EndSeries(
+            action="end_series",
+            series_id=binding.schedule_series_id,
+            expected_revision=binding.schedule_revision,
+            last_date=last_date,
+            source_id=source.id,
+        )
+
+    raise ValueError("Неизвестное приглашение расписания.")
+
+
+async def validate_schedule_reply(source: Source, store: Store) -> str | None:
+    """Проверить структуру и смысл ответа на приглашение, не загружая вложения."""
+    if source.reply_to_message_id is None:
+        return None
+    binding = await store.get_card_binding(source.chat_id, source.reply_to_message_id)
+    if binding is None or binding.schedule_action is None:
+        return None
+    try:
+        await _parse_schedule_change(source, binding, store, poster_source_id=None)
+    except (ValueError, TemplateError) as error:
+        return str(error)
+    return None
+
+
+async def repeat_schedule_reply(message: Message, source: Source, store: Store) -> bool:
+    """Повторить существующее изменение расписания для уже обработанного источника."""
+    draft = await store.get_schedule_change_for_source(source.id)
+    if draft is None:
+        return False
+    if draft.status == "pending":
+        await _schedule_draft_preview(message, draft, store)
+    else:
+        await _answer_chunks(message, "Это изменение расписания уже обработано или заменено.")
+    return True
 
 
 def _version_on_date(
@@ -383,9 +507,7 @@ async def _schedule_draft_preview(message: Message, draft: ChangeDraft, store: S
         )
         text = (
             f"Предпросмотр · {change_name}\n"
-            f"Серия №{change.series_id} · исходная дата {_date_label(change.original_date)}\n"
-            f"Базовая ревизия серии: {draft.base_revision}. "
-            f"Версия подтверждения: {draft.version}."
+            f"Серия №{change.series_id} · исходная дата {_date_label(change.original_date)}"
         )
         if isinstance(change, TransferOccurrence):
             versions, exceptions = await store.get_schedule()
@@ -441,11 +563,10 @@ async def _schedule_draft_preview(message: Message, draft: ChangeDraft, store: S
         )
     else:
         raise ValueError("Неизвестный тип изменения серии.")
-    heading += f"Ревизия серии: {draft.base_revision} · версия предпросмотра: {draft.version}."
     if draft.superseded_versions:
-        heading += "\n\nБудут замещены будущие версии:"
+        heading += "\n\nБудут изменены будущие периоды:"
         for version in draft.superseded_versions:
-            heading += f"\n• {version.revision} с {_date_label(version.effective_from)}"
+            heading += f"\n• с {_date_label(version.effective_from)}"
     await _send_bound_text(message, heading, store)
 
     for exception in draft.affected_exceptions:
@@ -541,94 +662,33 @@ async def handle_schedule_reply(
     if binding is None or binding.schedule_action is None:
         return False
     try:
-        if source.is_photo and binding.schedule_action in {"transfer_occurrence", "end_series"}:
-            instruction = (
-                "Для переноса занятия отправьте дату и время без фото."
-                if binding.schedule_action == "transfer_occurrence"
-                else "Для завершения серии отправьте последнюю дату без фото."
-            )
-            raise ValueError(f"{instruction} Фото сохранено в исходных сообщениях.")
-        if binding.schedule_series_id is None or binding.schedule_revision is None:
-            raise ValueError("Приглашение для изменения расписания повреждено.")
+        change = await _parse_schedule_change(
+            source, binding, store, poster_source_id=poster_source_id
+        )
         now = datetime.now(_MOSCOW)
-        if binding.schedule_action == "transfer_occurrence":
-            if binding.schedule_original_date is None:
-                raise ValueError("Приглашение для переноса не содержит исходную дату.")
-            text = source.text or ""
-            new_date, new_time, place = _parse_transfer_text(text)
-            change: ScheduleChange = TransferOccurrence(
-                action="transfer_occurrence",
-                series_id=binding.schedule_series_id,
-                expected_revision=binding.schedule_revision,
-                expected_exception_revision=binding.expected_exception_revision,
-                original_date=binding.schedule_original_date,
-                new_date=new_date,
-                new_time=new_time,
-                place=place,
-                source_id=source.id,
-            )
-        elif binding.schedule_action == "change_series":
-            effective_from, data = _parse_series_text(source.text or "")
-            change = ChangeSeries(
-                action="change_series",
-                series_id=binding.schedule_series_id,
-                expected_revision=binding.schedule_revision,
-                effective_from=effective_from,
-                data=data,
-                source_id=source.id,
-                poster_source_id=poster_source_id,
-            )
-        elif binding.schedule_action == "remove_poster":
-            if source.is_photo:
-                raise ValueError("Для снятия афиши отправьте только дату текстом.")
-            effective_from = _parse_effective_date(source.text or "")
-            versions, _ = await store.get_schedule()
-            version = _version_on_date(versions, binding.schedule_series_id, effective_from)
-            if version is None:
-                raise ValueError("На эту дату у серии нет действующего расписания.")
-            data = _next_rule_data(version.data, effective_from)
-            if version.effective_until is not None:
-                last_date = date.fromordinal(version.effective_until.toordinal() - 1)
-                if data.last_date is None or last_date < data.last_date:
-                    if data.first_date > last_date:
-                        raise ValueError(
-                            "На эту дату у серии уже не осталось регулярных проведений."
-                        )
-                    data = data.model_copy(update={"last_date": last_date})
-            change = ChangeSeries(
-                action="change_series",
-                series_id=binding.schedule_series_id,
-                expected_revision=binding.schedule_revision,
-                effective_from=effective_from,
-                data=data,
-                source_id=source.id,
-                remove_poster=True,
-            )
-        elif binding.schedule_action == "end_series":
-            if source.text is None:
-                raise ValueError("Отправьте последнюю дату в формате ДД.ММ.ГГГГ.")
-            last_date = parse_schedule_date(source.text.strip())
-            change = EndSeries(
-                action="end_series",
-                series_id=binding.schedule_series_id,
-                expected_revision=binding.schedule_revision,
-                last_date=last_date,
-                source_id=source.id,
-            )
-        else:
-            raise ValueError("Неизвестное приглашение расписания.")
         draft = await store.propose_schedule_change(change, now)
         if draft.status != "pending":
             await store.mark_source_processed(source.id)
-            await message.answer(
-                "Это изменение расписания уже обработано или заменено новой версией."
-            )
+            await _answer_chunks(message, "Это изменение расписания уже обработано или заменено.")
             return True
         await _schedule_draft_preview(message, draft, store)
         await store.mark_source_processed(source.id)
     except (ValueError, TemplateError) as error:
-        await store.set_source_error(source.id, str(error))
-        await show_source(message, await store.get_source_by_id(source.id) or source, store)
+        reason = str(error)
+        await store.reject_source(source.id, reason)
+        stale = any(
+            word in reason.casefold()
+            for word in ("устар", "неактивна", "неизвестная", "расписание изменилось")
+        )
+        guidance = (
+            "Расписание не изменено. Откройте /schedule и повторите изменение "
+            "по актуальному расписанию."
+            if stale
+            else "Расписание не изменено. Отправьте ответом на исходное приглашение "
+            "полный исправленный запрос. Если приглашение устарело, откройте /schedule "
+            "и выберите действие заново."
+        )
+        await _answer_chunks(message, f"Изменение не принято:\n{reason}\n{guidance}")
     return True
 
 
@@ -655,9 +715,14 @@ async def handle_schedule_action(message: Message, action: CardAction, store: St
         ):
             raise ValueError("Кнопка проведения повреждена.")
         if action.action == "schedule_transfer":
-            prompt = await message.answer(
+            prompt_text = (
                 "Ответьте на сообщение и укажите новую дату и время. Формат:\n"
                 "Дата: ДД.ММ.ГГГГ\nВремя: ЧЧ:ММ\nМесто: необязательно"
+            )
+            prompt = await message.answer(
+                prompt_text,
+                entities=entities_for_text(prompt_text, heading_lines=(0,)),
+                parse_mode=None,
             )
             await store.bind_card_message(
                 CardBinding(
@@ -699,7 +764,11 @@ async def handle_schedule_action(message: Message, action: CardAction, store: St
                 "Ответьте датой начала действия: «Действует с: ДД.ММ.ГГГГ». "
                 "Снятие афиши начнётся с указанной даты."
             )
-            prompt = await message.answer(prompt_text)
+            prompt = await message.answer(
+                prompt_text,
+                entities=entities_for_text(prompt_text, heading_lines=(0,)),
+                parse_mode=None,
+            )
             await store.bind_card_message(
                 CardBinding(
                     chat_id=prompt.chat.id,
@@ -718,7 +787,11 @@ async def handle_schedule_action(message: Message, action: CardAction, store: St
             if action.action == "schedule_change_series"
             else "Ответьте на сообщение последней датой серии в формате ДД.ММ.ГГГГ."
         )
-        prompt = await message.answer(prompt_text)
+        prompt = await message.answer(
+            prompt_text,
+            entities=entities_for_text(prompt_text, heading_lines=(0,)),
+            parse_mode=None,
+        )
         await store.bind_card_message(
             CardBinding(
                 chat_id=prompt.chat.id,
@@ -739,10 +812,10 @@ async def handle_schedule_action(message: Message, action: CardAction, store: St
             await store.confirm_schedule_change(
                 action.schedule_draft_id, action.schedule_draft_version, now
             )
-            await message.answer("Расписание изменено.")
+            await _answer_chunks(message, "Расписание изменено.")
             return "Изменение расписания подтверждено."
         await store.discard_schedule_change(action.schedule_draft_id, action.schedule_draft_version)
-        await message.answer("Предпросмотр удалён; серия и исключения не изменились.")
+        await _answer_chunks(message, "Предпросмотр удалён; серия и исключения не изменились.")
         return "Изменение не применено."
 
     if action.action in {"schedule_resolve_remove", "schedule_resolve_detach"}:

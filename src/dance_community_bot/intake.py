@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, ForceReply, Message
 
-from .cards import show_draft, show_events, show_record, show_source
+from .cards import _answer_chunks, show_draft, show_events, show_record, show_source
+from .formatting import entities_for_text
 from .models import (
     CardAction,
     CardBinding,
@@ -20,7 +21,12 @@ from .models import (
     Source,
     SourceInput,
 )
-from .schedule_handlers import handle_schedule_action, handle_schedule_reply
+from .schedule_handlers import (
+    handle_schedule_action,
+    handle_schedule_reply,
+    repeat_schedule_reply,
+    validate_schedule_reply,
+)
 from .storage import Store
 from .templates import TemplateError, parse_class_template, parse_event_template
 
@@ -207,15 +213,45 @@ async def _save_draft(
             "Карточка изменилась или стала недоступна. Откройте /events; "
             "затем отправьте шаблон ещё раз.",
         )
-        await message.answer(
-            "Карточка изменилась или стала недоступна. Откройте /events и отправьте шаблон ещё раз."
+        await _answer_chunks(
+            message,
+            "Карточка изменилась или стала недоступна. Откройте /events и отправьте шаблон "
+            "ещё раз.",
         )
         return None
     return draft
 
 
-async def _show_source_error(message: Message, source: Source, store: Store) -> None:
-    await show_source(message, source, store)
+def _source_rejection_message(
+    reason: str,
+    *,
+    guidance: Literal["new", "edit", "schedule", "stale"],
+) -> str:
+    next_step = {
+        "new": "Отправьте полный шаблон /event или /class заново. "
+        "Если нужна афиша, приложите одну фотографию к полному шаблону.",
+        "edit": "Карточка не изменена. Отправьте ответом на приглашение полный шаблон карточки. "
+        "Если нужна новая афиша, приложите одну фотографию к этому шаблону.",
+        "schedule": "Расписание не изменено. Отправьте полный исправленный запрос "
+        "ответом на исходное приглашение. Если приглашение устарело, откройте /schedule "
+        "и выберите действие заново.",
+        "stale": "Карточка не изменена. Откройте /events и начните исправление "
+        "с актуальной карточки.",
+    }[guidance]
+    details = reason.strip() or "Неизвестный формат ввода."
+    return f"Ввод не принят:\n{details}\n{next_step}"
+
+
+async def _reject_source(
+    message: Message,
+    source: Source,
+    reason: str,
+    store: Store,
+    *,
+    guidance: Literal["new", "edit", "schedule", "stale"],
+) -> None:
+    await store.reject_source(source.id, reason)
+    await _answer_chunks(message, _source_rejection_message(reason, guidance=guidance))
 
 
 async def _repeat_source(message: Message, source: Source, store: Store) -> None:
@@ -242,66 +278,78 @@ async def _repeat_source(message: Message, source: Source, store: Store) -> None
             await show_record(message, record, store)
             return
         if draft.status in {"rejected", "superseded"}:
-            await message.answer(
-                "Это сообщение уже обработано; откройте /events для текущего состояния."
+            await _answer_chunks(
+                message, "Это сообщение уже обработано; откройте /events для текущего состояния."
             )
             return
 
-    if source.status == "failed" and source.attachment_status != "failed":
-        await _show_source_error(message, source, store)
+    if source.status == "processed" and source.error_reason is not None:
+        context, stale = await _resolve_edit_context(
+            source.chat_id, source.reply_to_message_id, store
+        )
+        guidance: Literal["new", "edit", "stale"] = (
+            "stale" if stale else "edit" if context is not None else "new"
+        )
+        await _answer_chunks(
+            message,
+            _source_rejection_message(source.error_reason, guidance=guidance),
+        )
         return
-    if source.attachment_status == "failed" and source.telegram_file_id is not None:
-        await _process_source(message, source, store, resolve_reply=True)
-        return
-
-    await _process_source(message, source, store, resolve_reply=True)
+    await _process_source(message, source, store)
 
 
 async def _process_source(
     message: Message,
     source: Source,
     store: Store,
-    *,
-    resolve_reply: bool,
 ) -> None:
     text = source.text or ""
-    context: _EditContext | None = None
-    inherited_poster: Source | None = None
-    if resolve_reply:
-        context, stale = await _resolve_edit_context(
-            source.chat_id,
-            source.reply_to_message_id,
-            store,
-        )
-        if stale:
-            await store.set_source_error(source.id, "Карточка устарела. Откройте /events.")
-            await _show_source_error(
-                message, await store.get_source_by_id(source.id) or source, store
-            )
-            return
-
-        if source.reply_to_message_id is not None:
-            binding = await store.get_card_binding(source.chat_id, source.reply_to_message_id)
-            if binding is not None and binding.source_id is not None:
-                candidate = await store.get_source_by_id(binding.source_id)
-                if (
-                    candidate is not None
-                    and candidate.is_photo
-                    and candidate.attachment_status != "removed"
-                ):
-                    inherited_poster = candidate
-
     photo_present = source.is_photo
+    context, stale = await _resolve_edit_context(
+        source.chat_id,
+        source.reply_to_message_id,
+        store,
+    )
+    if stale:
+        await _reject_source(
+            message,
+            source,
+            "Карточка изменилась или больше недоступна.",
+            store,
+            guidance="stale",
+        )
+        return
+
     if source.media_group_id is not None:
-        reason = "Альбомы не поддерживаются. Отправьте одну фотографию ответом на карточку."
-        await store.set_source_error(source.id, reason)
-        await _show_source_error(message, await store.get_source_by_id(source.id) or source, store)
+        await _reject_source(
+            message,
+            source,
+            "Альбомы не поддерживаются.",
+            store,
+            guidance="edit" if context is not None else "new",
+        )
         return
     if source.telegram_file_id is not None and not source.is_photo:
-        reason = "Документы не поддерживаются как афиша. Отправьте одну фотографию."
-        await store.set_source_error(source.id, reason)
-        await _show_source_error(message, await store.get_source_by_id(source.id) or source, store)
+        await _reject_source(
+            message,
+            source,
+            "Документы не поддерживаются как афиша.",
+            store,
+            guidance="edit" if context is not None else "new",
+        )
         return
+
+    inherited_poster: Source | None = None
+    if source.reply_to_message_id is not None:
+        binding = await store.get_card_binding(source.chat_id, source.reply_to_message_id)
+        if binding is not None and binding.source_id is not None:
+            candidate = await store.get_source_by_id(binding.source_id)
+            if (
+                candidate is not None
+                and candidate.is_photo
+                and candidate.attachment_status != "removed"
+            ):
+                inherited_poster = candidate
 
     if (
         context is not None
@@ -334,6 +382,30 @@ async def _process_source(
     elif context is not None and photo_present:
         data = context.data
 
+    if parse_error is not None:
+        await _reject_source(
+            message,
+            source,
+            parse_error,
+            store,
+            guidance="edit" if context is not None else "new",
+        )
+        return
+    if data is None:
+        reason = (
+            "В сообщении нет полного шаблона."
+            if photo_present
+            else "Отправьте полный шаблон /event или /class."
+        )
+        await _reject_source(
+            message,
+            source,
+            reason,
+            store,
+            guidance="edit" if context is not None else "new",
+        )
+        return
+
     poster_saved = True
     if photo_present:
         poster_saved = await _download_poster(
@@ -343,22 +415,6 @@ async def _process_source(
         )
     elif inherited_poster is not None:
         poster_saved = await _download_poster(message, inherited_poster, store)
-
-    if parse_error is not None:
-        reason = f"{parse_error}\nИсточник сохранён; отправьте исправленный шаблон."
-        await store.set_source_error(source.id, reason)
-        await _show_source_error(message, await store.get_source_by_id(source.id) or source, store)
-        return
-    if data is None:
-        reason = (
-            "Фото без шаблона сохранено. Отправьте шаблон текста или добавьте фото "
-            "ответом на карточку."
-            if photo_present
-            else "Отправьте полный шаблон /event или /class. Источник сохранён в /events."
-        )
-        await store.set_source_error(source.id, reason)
-        await _show_source_error(message, await store.get_source_by_id(source.id) or source, store)
-        return
 
     poster_source_id = context.poster_source_id if context is not None else None
     if inherited_poster is not None:
@@ -391,22 +447,51 @@ async def ingest_message(message: Message, store: Store) -> None:
     source = await store.save_source(source_input)
     if await _handle_schedule_source(message, source, store):
         return
-    if message.media_group_id is None:
-        await _process_source(message, source, store, resolve_reply=True)
-    else:
-        await _process_source(message, source, store, resolve_reply=False)
+    await _process_source(message, source, store)
 
 
 async def _handle_schedule_source(message: Message, source: Source, store: Store) -> bool:
-    if source.media_group_id is not None or (
-        source.telegram_file_id is not None and not source.is_photo
-    ):
-        return False
     if source.reply_to_message_id is None:
         return False
     binding = await store.get_card_binding(source.chat_id, source.reply_to_message_id)
     if binding is None or binding.schedule_action is None:
         return False
+    if await repeat_schedule_reply(message, source, store):
+        return True
+    if source.status == "processed" and source.error_reason is not None:
+        await _answer_chunks(
+            message, _source_rejection_message(source.error_reason, guidance="schedule")
+        )
+        return True
+    if source.media_group_id is not None:
+        await _reject_source(
+            message,
+            source,
+            "Альбомы не поддерживаются.",
+            store,
+            guidance="schedule",
+        )
+        return True
+    if source.telegram_file_id is not None and not source.is_photo:
+        await _reject_source(
+            message,
+            source,
+            "Документы не поддерживаются как афиша.",
+            store,
+            guidance="schedule",
+        )
+        return True
+    rejection = await validate_schedule_reply(source, store)
+    if rejection is not None:
+        await _reject_source(
+            message,
+            source,
+            rejection,
+            store,
+            guidance="schedule",
+        )
+        return True
+
     poster = source if source.is_photo else None
     if poster is None and binding.schedule_action == "change_series":
         source_id = binding.source_id
@@ -434,12 +519,7 @@ async def _handle_schedule_source(message: Message, source: Source, store: Store
             await show_source(message, await store.get_source_by_id(source.id) or source, store)
             return True
         poster_source_id = poster.id
-    handled = await handle_schedule_reply(message, source, store, poster_source_id=poster_source_id)
-    if poster_source_id is not None and poster_source_id != source.id:
-        processed = await store.get_source_by_id(source.id)
-        if processed is not None and processed.status == "processed":
-            await store.mark_source_processed(poster_source_id)
-    return handled
+    return await handle_schedule_reply(message, source, store, poster_source_id=poster_source_id)
 
 
 async def handle_card_action(callback: CallbackQuery, store: Store) -> None:
@@ -474,7 +554,7 @@ async def handle_card_action(callback: CallbackQuery, store: Store) -> None:
             outcome = await _apply_card_action(message, action, store)
     except ValueError as error:
         outcome = str(error)
-        await message.answer(outcome)
+        await _answer_chunks(message, outcome)
     else:
         if action.action in {"confirm", "reject", "cancel", "remove_poster"}:
             await store.complete_card_action(action.token, outcome)
@@ -486,12 +566,12 @@ async def _apply_card_action(message: Message, action: CardAction, store: Store)
         if action.draft_id is not None:
             draft = await store.get_draft(action.draft_id)
             if draft is not None and draft.status == "pending":
-                await show_draft(message, draft, store)
+                await show_draft(message, draft, store, with_poster=True)
                 return "Черновик открыт."
         if action.record_id is not None:
             record = await store.get_record(action.record_id)
             if record is not None:
-                await show_record(message, record, store)
+                await show_record(message, record, store, with_poster=True)
                 return "Карточка открыта."
         if action.source_id is not None:
             source = await store.get_source_by_id(action.source_id)
@@ -511,14 +591,14 @@ async def _apply_card_action(message: Message, action: CardAction, store: Store)
         if action.draft_id is None or action.version is None:
             raise ValueError("Кнопка отклонения повреждена.")
         await store.reject_draft(action.draft_id, action.version)
-        await message.answer("Черновик отклонён; подтверждённая версия не менялась.")
+        await _answer_chunks(message, "Черновик отклонён; подтверждённая версия не менялась.")
         return "Черновик отклонён."
 
     if action.action == "cancel":
         if action.record_id is None or action.revision is None:
             raise ValueError("Кнопка отмены повреждена.")
         record = await store.cancel_record(action.record_id, action.revision)
-        await message.answer(f"Запись №{record.id} отменена.")
+        await _answer_chunks(message, f"Запись №{record.id} отменена.")
         return "Запись отменена."
 
     if action.action == "edit":
@@ -532,10 +612,18 @@ async def _apply_card_action(message: Message, action: CardAction, store: Store)
         )
         context, stale = await _context_from_binding(binding, store)
         if context is None or stale:
-            raise ValueError("Карточка устарела. Откройте /events.")
-        prompt = await message.answer(
-            "Отправьте полный шаблон ответом на это сообщение. "
+            raise ValueError("Карточка изменилась. Откройте /events и начните действие заново.")
+        prompt_text = (
+            "Исправление карточки\n"
+            "Ответьте на это сообщение полным шаблоном.\n\n"
+            "Отдельное новое сообщение создаст новую запись.\n"
             "Пропущенные необязательные поля очистятся; афиша сохранится."
+        )
+        prompt = await message.answer(
+            prompt_text,
+            entities=entities_for_text(prompt_text, heading_lines=(0,)),
+            parse_mode=None,
+            reply_markup=ForceReply(),
         )
         await store.bind_card_message(
             binding.model_copy(update={"bot_message_id": prompt.message_id})
@@ -556,7 +644,7 @@ async def _apply_card_action(message: Message, action: CardAction, store: Store)
                 raise ValueError("Источник уже связан с карточкой. Откройте /events.")
             if await _handle_schedule_source(message, source, store):
                 return "Состояние вложения обновлено."
-            await _process_source(message, source, store, resolve_reply=True)
+            await _process_source(message, source, store)
             return "Состояние вложения обновлено."
         draft = await store.get_draft(action.draft_id)
         if (
@@ -565,7 +653,7 @@ async def _apply_card_action(message: Message, action: CardAction, store: Store)
             or draft.status != "pending"
             or draft.poster_source_id != source.id
         ):
-            raise ValueError("Черновик устарел. Откройте /events.")
+            raise ValueError("Карточка изменилась. Откройте /events и начните действие заново.")
         if await _download_poster(message, source, store):
             await store.mark_source_processed(source.id)
             current_draft = await store.get_draft(draft.id) or draft

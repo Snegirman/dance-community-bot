@@ -592,14 +592,17 @@ def test_long_owner_change_notification_is_split_at_telegram_utf16_limit(
             bot,
         )
 
-        owner_messages = [
-            request.text
+        owner_requests = [
+            request
             for request in session.requests
             if isinstance(request, SendMessage) and request.chat_id == OWNER_ID
         ]
+        owner_messages = [request.text for request in owner_requests]
         assert owner_messages
         assert all(len(text.encode("utf-16-le")) // 2 <= 4096 for text in owner_messages)
         assert sum(text.count("🙂") for text in owner_messages) == 5000
+        assert all(request.parse_mode is None for request in owner_requests)
+        assert owner_requests[0].entities
         assert await store.list_pending_publication_notifications() == []
         await bot.session.close()
 

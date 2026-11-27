@@ -112,6 +112,14 @@ def test_late_or_restarted_scheduler_notifies_without_catching_up(tmp_path: Path
         assert await store.get_publication_for_week(GROUP_ID, date(2026, 11, 9)) is None
         assert message_count(session, OWNER_ID) == 1
         assert "пропущ" in session.messages[-1].casefold()
+        notice = next(
+            request
+            for request in session.requests
+            if isinstance(request, SendMessage) and request.chat_id == OWNER_ID
+        )
+        assert notice.text.startswith("⏰ Время публикации пропущено\n")
+        assert notice.parse_mode is None
+        assert notice.entities
 
         await check_publication(
             datetime(2026, 11, 10, 9, 1, 15, tzinfo=MOSCOW), settings, store, bot
@@ -169,6 +177,14 @@ def test_empty_week_notifies_once_and_is_not_published(tmp_path: Path) -> None:
         assert message_count(session, GROUP_ID) == 0
         assert message_count(session, OWNER_ID) == 1
         assert "записей нет" in session.messages[-1].casefold()
+        notice = next(
+            request
+            for request in session.requests
+            if isinstance(request, SendMessage) and request.chat_id == OWNER_ID
+        )
+        assert notice.text.startswith("📅 Публикация не выполнена\n")
+        assert notice.parse_mode is None
+        assert notice.entities
         await bot.session.close()
 
     asyncio.run(scenario())

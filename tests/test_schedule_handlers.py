@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, date, datetime, time, tzinfo
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -14,6 +14,7 @@ from telegram_transport import RecordingSession
 
 from dance_community_bot import schedule_handlers
 from dance_community_bot.bot import create_dispatcher
+from dance_community_bot.cards import show_events, show_source
 from dance_community_bot.config import Settings
 from dance_community_bot.intake import handle_card_action, ingest_message
 from dance_community_bot.models import (
@@ -59,6 +60,31 @@ def test_schedule_date_parser_rejects_noncanonical_or_relative_dates(
     with pytest.raises(ValueError) as error:
         parse_schedule_date(value)
     assert str(error.value) == expected_error
+
+
+def test_schedule_heading_uses_message_entities(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        session = RecordingSession(CHAT_ID)
+        bot = Bot(token=TOKEN, session=session)
+        store = Store(tmp_path / "schedule-formatting.sqlite3")
+        await store.initialize()
+        message = Message(
+            message_id=1,
+            date=datetime(2026, 11, 9, 9, tzinfo=UTC),
+            chat=Chat(id=CHAT_ID, type="private"),
+            from_user=User(id=CHAT_ID, is_bot=False, first_name="Владелец"),
+            text="/schedule",
+        ).as_(bot)
+
+        await schedule_command_handler(message, store)
+
+        heading = next(request for request in session.requests if isinstance(request, SendMessage))
+        assert heading.parse_mode is None
+        assert heading.entities is not None
+        assert any(entity.type == "bold" and entity.offset == 0 for entity in heading.entities)
+        await session.close()
+
+    asyncio.run(scenario())
 
 
 def test_long_schedule_card_binds_actions_only_to_last_delivered_chunk(
@@ -161,7 +187,7 @@ def test_long_schedule_card_binds_actions_only_to_last_delivered_chunk(
 
 
 @pytest.mark.parametrize("schedule_action", ["transfer_occurrence", "end_series"])
-def test_schedule_rejects_photo_replies_but_keeps_text_correction_context(
+def test_schedule_rejects_photo_replies_without_download_or_recovery_card(
     tmp_path: Path, schedule_action: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
@@ -225,20 +251,20 @@ def test_schedule_rejects_photo_replies_but_keeps_text_correction_context(
             await ingest_message(photo, store)
             rejected_source = await store.get_source(CHAT_ID, 2)
             assert rejected_source is not None
-            assert rejected_source.status == "failed"
-            assert rejected_source.attachment_status == "saved"
-            assert rejected_source.poster_path is not None
-            assert (
-                store.path.parent / rejected_source.poster_path
-            ).read_bytes() == session.poster_bytes
+            assert rejected_source.status == "processed"
+            assert rejected_source.attachment_status == "none"
+            assert rejected_source.poster_path is None
             assert "фото" in (rejected_source.error_reason or "").lower()
             assert await store.list_pending_schedule_changes() == []
-
-            sent = [request for request in session.requests if isinstance(request, SendMessage)]
-            correction_prompt_id = 100 + len(sent)
-            bound = await store.get_card_binding(CHAT_ID, correction_prompt_id)
-            assert bound is not None
-            assert bound.schedule_action == schedule_action
+            assert not any(request.__class__.__name__ == "GetFile" for request in session.requests)
+            assert (await store.get_automation_status()).incomplete_attachments == 0
+            assert "полный исправленный запрос" in session.messages[-1].lower()
+            assert "если приглашение устарело, откройте /schedule" in session.messages[-1].lower()
+            rejection_text = session.messages[-1]
+            restarted = Store(store.path)
+            await restarted.initialize()
+            await ingest_message(photo, restarted)
+            assert session.messages[-1] == rejection_text
 
             correction_text = (
                 "Дата: 18.11.2026\nВремя: 20:30"
@@ -252,7 +278,7 @@ def test_schedule_rejects_photo_replies_but_keeps_text_correction_context(
                 from_user=User(id=CHAT_ID, is_bot=False, first_name="Владелец"),
                 text=correction_text,
                 reply_to_message=Message(
-                    message_id=correction_prompt_id,
+                    message_id=90,
                     date=now,
                     chat=Chat(id=CHAT_ID, type="private"),
                 ),
@@ -272,7 +298,287 @@ def test_schedule_rejects_photo_replies_but_keeps_text_correction_context(
     asyncio.run(scenario())
 
 
-def test_long_schedule_reply_error_is_chunked_and_remains_correctable(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "template",
+    [
+        "Действует с: 09.11.2026\nНазвание: Waving\nПервая дата: 09.11.2026\nВремя: 21:00",
+        "Действует с: 01.12.2026\nНазвание: Waving\nПервая дата: 30.11.2026\nВремя: 21:00",
+    ],
+)
+def test_invalid_schedule_photo_is_rejected_before_download(
+    tmp_path: Path, template: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        now = datetime(2026, 11, 9, 9, tzinfo=UTC)
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz: tzinfo | None = None) -> datetime:
+                return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+
+        monkeypatch.setattr(schedule_handlers, "datetime", FrozenDateTime)
+        session = RecordingSession(CHAT_ID)
+        bot = Bot(token=TOKEN, session=session)
+        store = Store(tmp_path / "invalid-schedule-photo.sqlite3")
+        await store.initialize()
+        source = await store.save_source(
+            SourceInput(chat_id=CHAT_ID, message_id=1, received_at=now, text="class")
+        )
+        draft = await store.save_draft(
+            source.id,
+            ClassData(title="Popping", first_date=date(2026, 11, 10), start_time=time(19)),
+            poster_source_id=None,
+        )
+        record = await store.confirm_draft(draft.id, draft.version)
+        await store.bind_card_message(
+            CardBinding(
+                chat_id=CHAT_ID,
+                bot_message_id=90,
+                schedule_action="change_series",
+                schedule_series_id=record.id,
+                schedule_revision=record.revision,
+            )
+        )
+        message = Message(
+            message_id=2,
+            date=now,
+            chat=Chat(id=CHAT_ID, type="private"),
+            from_user=User(id=CHAT_ID, is_bot=False, first_name="Владелец"),
+            caption=template,
+            photo=[
+                PhotoSize(
+                    file_id="invalid-schedule-poster",
+                    file_unique_id="invalid-schedule-poster",
+                    width=20,
+                    height=20,
+                )
+            ],
+            reply_to_message=Message(
+                message_id=90, date=now, chat=Chat(id=CHAT_ID, type="private")
+            ),
+        ).as_(bot)
+        try:
+            await ingest_message(message, store)
+            rejected_source = await store.get_source(CHAT_ID, 2)
+            assert rejected_source is not None and rejected_source.status == "processed"
+            assert rejected_source.attachment_status == "none"
+            assert rejected_source.poster_path is None
+            assert await store.get_record(record.id) == record
+            assert await store.list_pending_schedule_changes() == []
+            assert (await store.get_automation_status()).incomplete_attachments == 0
+            assert not any(request.__class__.__name__ == "GetFile" for request in session.requests)
+            assert "полный исправленный запрос" in session.messages[-1].lower()
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_schedule_redelivery_replays_existing_draft_before_date_revalidation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        now = [datetime(2026, 11, 9, 9, tzinfo=UTC)]
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz: tzinfo | None = None) -> datetime:
+                current = now[0]
+                return current.astimezone(tz) if tz is not None else current.replace(tzinfo=None)
+
+        monkeypatch.setattr(schedule_handlers, "datetime", FrozenDateTime)
+        session = RecordingSession(CHAT_ID)
+        bot = Bot(token=TOKEN, session=session)
+        store = Store(tmp_path / "schedule-redelivery.sqlite3")
+        await store.initialize()
+        source = await store.save_source(
+            SourceInput(chat_id=CHAT_ID, message_id=1, received_at=now[0], text="class")
+        )
+        draft = await store.save_draft(
+            source.id,
+            ClassData(title="Popping", first_date=date(2026, 11, 10), start_time=time(19)),
+            poster_source_id=None,
+        )
+        record = await store.confirm_draft(draft.id, draft.version)
+        await store.bind_card_message(
+            CardBinding(
+                chat_id=CHAT_ID,
+                bot_message_id=90,
+                schedule_action="change_series",
+                schedule_series_id=record.id,
+                schedule_revision=record.revision,
+            )
+        )
+        message = Message(
+            message_id=2,
+            date=now[0],
+            chat=Chat(id=CHAT_ID, type="private"),
+            from_user=User(id=CHAT_ID, is_bot=False, first_name="Владелец"),
+            text=(
+                "Действует с: 10.11.2026\nНазвание: Waving\nПервая дата: 10.11.2026\nВремя: 21:00"
+            ),
+            reply_to_message=Message(
+                message_id=90, date=now[0], chat=Chat(id=CHAT_ID, type="private")
+            ),
+        ).as_(bot)
+        try:
+            await ingest_message(message, store)
+            first_drafts = await store.list_pending_schedule_changes()
+            assert len(first_drafts) == 1
+            assert first_drafts[0].change.source_id == 2
+
+            now[0] = datetime(2026, 11, 11, 9, tzinfo=UTC)
+            first_message_count = len(session.messages)
+            await ingest_message(message, Store(store.path))
+
+            pending = await store.list_pending_schedule_changes()
+            replayed_source = await store.get_source(CHAT_ID, 2)
+            assert len(pending) == 1 and pending[0].id == first_drafts[0].id
+            assert replayed_source is not None and replayed_source.status == "processed"
+            assert replayed_source.error_reason is None
+            assert "Предпросмотр · новое расписание" in "\n".join(
+                session.messages[first_message_count:]
+            )
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_inherited_schedule_poster_is_completed_atomically_and_replay_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        now = datetime.now(UTC)
+        today = datetime.now(ZoneInfo("Europe/Moscow")).date()
+        effective_from = today + timedelta(days=3)
+        session = RecordingSession(CHAT_ID)
+        bot = Bot(token=TOKEN, session=session)
+        store = Store(tmp_path / "inherited-poster-replay.sqlite3")
+        await store.initialize()
+        series_source = await store.save_source(
+            SourceInput(chat_id=CHAT_ID, message_id=1, received_at=now, text="class")
+        )
+        series_draft = await store.save_draft(
+            series_source.id,
+            ClassData(title="Old title", first_date=effective_from, start_time=time(19)),
+            poster_source_id=None,
+        )
+        series = await store.confirm_draft(series_draft.id, series_draft.version)
+        await store.bind_card_message(
+            CardBinding(
+                chat_id=CHAT_ID,
+                bot_message_id=90,
+                schedule_action="change_series",
+                schedule_series_id=series.id,
+                schedule_revision=series.revision,
+            )
+        )
+
+        template = (
+            f"Действует с: {effective_from:%d.%m.%Y}\n"
+            "Название: New title\n"
+            f"Первая дата: {effective_from:%d.%m.%Y}\n"
+            "Время: 20:00"
+        )
+        failed_poster = await store.save_source(
+            SourceInput(
+                chat_id=CHAT_ID,
+                message_id=2,
+                received_at=now,
+                text=template,
+                telegram_file_id="failed-poster",
+                is_photo=True,
+                reply_to_message_id=90,
+            )
+        )
+        await store.set_source_error(failed_poster.id, "Временная ошибка загрузки афиши.")
+        failed_poster_message = Message(
+            message_id=2,
+            date=now,
+            chat=Chat(id=CHAT_ID, type="private"),
+            from_user=User(id=CHAT_ID, is_bot=False, first_name="Владелец"),
+            caption=template,
+            photo=[
+                PhotoSize(
+                    file_id="failed-poster",
+                    file_unique_id="failed-poster",
+                    width=20,
+                    height=20,
+                )
+            ],
+            reply_to_message=Message(
+                message_id=90, date=now, chat=Chat(id=CHAT_ID, type="private")
+            ),
+        ).as_(bot)
+        await show_source(
+            failed_poster_message,
+            await store.get_source_by_id(failed_poster.id) or failed_poster,
+            store,
+        )
+        error_message_id = 100 + len(session.messages) + len(session.photos)
+        error_binding = await store.get_card_binding(CHAT_ID, error_message_id)
+        assert error_binding is not None and error_binding.source_id == failed_poster.id
+        assert error_binding.schedule_action == "change_series"
+
+        reply = Message(
+            message_id=3,
+            date=now,
+            chat=Chat(id=CHAT_ID, type="private"),
+            from_user=User(id=CHAT_ID, is_bot=False, first_name="Владелец"),
+            text=template,
+            reply_to_message=Message(
+                message_id=error_message_id, date=now, chat=Chat(id=CHAT_ID, type="private")
+            ),
+        ).as_(bot)
+
+        async def fail_preview() -> bool:
+            raise RuntimeError("simulated schedule preview failure")
+
+        session.before_send_check = fail_preview
+        with pytest.raises(RuntimeError, match="simulated schedule preview failure"):
+            await ingest_message(reply, store)
+        session.before_send_check = None
+
+        after_failure = await store.get_source_by_id(failed_poster.id)
+        assert after_failure is not None and after_failure.attachment_status == "saved"
+        assert after_failure.status == "processed"
+        assert after_failure.poster_path is not None
+        assert (store.path.parent / after_failure.poster_path).read_bytes() == session.poster_bytes
+        changes = await store.list_pending_schedule_changes()
+        assert len(changes) == 1
+        assert isinstance(changes[0].change, ChangeSeries)
+        assert changes[0].change.poster_source_id == failed_poster.id
+
+        restarted = Store(store.path)
+        await restarted.initialize()
+        await ingest_message(reply, restarted)
+        await ingest_message(reply, restarted)
+        changes = await restarted.list_pending_schedule_changes()
+        assert len(changes) == 1
+        await restarted.confirm_schedule_change(changes[0].id, changes[0].version, now)
+        await restarted.confirm_schedule_change(changes[0].id, changes[0].version, now)
+
+        recovered_poster = await restarted.get_source_by_id(failed_poster.id)
+        assert recovered_poster is not None
+        assert recovered_poster.status == "processed"
+        assert recovered_poster.attachment_status == "saved"
+        assert recovered_poster.poster_path is not None
+        assert (
+            store.path.parent / recovered_poster.poster_path
+        ).read_bytes() == session.poster_bytes
+        assert all(source.status == "processed" for source in await restarted.list_sources())
+        await show_events(reply, restarted)
+        assert "Название: New title" in session.messages[-1]
+        assert "Афиша: добавлена" in session.messages[-1]
+        assert "Причина: обработку не удалось завершить" not in session.messages[-1]
+        assert len(await restarted.list_sources()) == 3
+        await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_long_schedule_reply_error_is_bounded_without_recovery_card(tmp_path: Path) -> None:
     class RejectLongSendSession(RecordingSession):
         async def make_request(
             self,
@@ -328,18 +634,17 @@ def test_long_schedule_reply_error_is_chunked_and_remains_correctable(tmp_path: 
         try:
             await ingest_message(message, store)
             failed_source = await store.get_source(CHAT_ID, 2)
-            assert failed_source is not None and failed_source.status == "failed"
+            assert failed_source is not None and failed_source.status == "processed"
             assert len(failed_source.error_reason or "") > 4096
             error_messages = [
                 request for request in session.requests if isinstance(request, SendMessage)
             ]
-            assert len(error_messages) > 1
+            assert error_messages
             assert all(
                 len(request.text.encode("utf-16-le")) // 2 <= 4096 for request in error_messages
             )
-            correction_prompt_id = 100 + len(error_messages)
-            binding = await store.get_card_binding(CHAT_ID, correction_prompt_id)
-            assert binding is not None and binding.schedule_action == "change_series"
+            assert all(request.reply_markup is None for request in error_messages)
+            assert "полный исправленный запрос" in error_messages[-1].text.lower()
 
             correction = Message(
                 message_id=3,
@@ -353,7 +658,7 @@ def test_long_schedule_reply_error_is_chunked_and_remains_correctable(tmp_path: 
                     "Время: 19:00"
                 ),
                 reply_to_message=Message(
-                    message_id=correction_prompt_id,
+                    message_id=90,
                     date=now,
                     chat=Chat(id=CHAT_ID, type="private"),
                 ),
@@ -507,6 +812,8 @@ def test_resolved_schedule_preview_recovers_after_send_failure_and_restart(tmp_p
         assert "На этой неделе нет регулярных проведений." in recovery_text
         assert "Предпросмотр · новое расписание" in recovery_text
         assert "Зал B" in recovery_text
+        assert "ревизия" not in recovery_text.lower()
+        assert "версия" not in recovery_text.lower()
 
         stale_action = await restarted.create_card_action(
             "schedule_confirm",
@@ -529,7 +836,7 @@ def test_resolved_schedule_preview_recovers_after_send_failure_and_restart(tmp_p
         still_pending = await restarted.list_pending_schedule_changes()
         assert len(still_pending) == 1
         assert still_pending[0].version == after_failure[0].version
-        assert "устарел" in session.messages[-1].lower()
+        assert "расписание изменилось" in session.messages[-1].lower()
         current_record = await restarted.get_record(record.id)
         assert current_record is not None and current_record.revision == record.revision
         await session.close()
@@ -590,6 +897,8 @@ def test_schedule_shows_moved_occurrence_in_origin_and_actual_weeks_with_bound_a
         )
         assert "10.11.2026" in origin_text
         assert "18.11.2026" in origin_text
+        assert "ревизия" not in origin_text.lower()
+        assert "версия" not in origin_text.lower()
         occurrence_message = next(
             request
             for request in session.requests

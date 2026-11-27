@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +10,7 @@ from typing import Literal
 from uuid import uuid4
 
 from aiogram import Bot
-from aiogram.enums import ChatType, ParseMode
+from aiogram.enums import ChatType
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
@@ -22,6 +21,7 @@ from aiogram.exceptions import (
 )
 from aiogram.types import BufferedInputFile
 
+from .formatting import entities_for_text
 from .models import (
     PhotoPostPart,
     PublicationClaimResult,
@@ -30,7 +30,7 @@ from .models import (
     WeeklyPost,
 )
 from .storage import Store
-from .weekly import build_weekly_post
+from .weekly import _SECTION_HEADINGS, build_weekly_post
 
 PublicationResultStatus = Literal[
     "prepared", "sending", "partial", "unknown", "delivered", "stale", "rejected"
@@ -85,10 +85,13 @@ def _stored_result(publication: PublicationState) -> PublicationResult:
 
 async def _send_text(bot: Bot, group_id: int, part: TextPostPart) -> tuple[SendOutcome, int | None]:
     try:
+        first_line = part.text.partition("\n")[0]
+        heading_lines = (0,) if first_line in _SECTION_HEADINGS else ()
         message = await bot.send_message(
             group_id,
-            html.escape(part.text),
-            parse_mode=ParseMode.HTML,
+            part.text,
+            entities=entities_for_text(part.text, heading_lines=heading_lines),
+            parse_mode=None,
             disable_web_page_preview=True,
         )
     except asyncio.CancelledError:
@@ -140,12 +143,14 @@ async def _send_photo(
     part: PhotoPostPart,
     prepared: PreparedPhoto,
 ) -> tuple[SendOutcome, int | None]:
+    caption_entities = entities_for_text(part.caption, heading_lines=(0,))
     try:
         message = await bot.send_photo(
             group_id,
             photo=prepared.file_id,
-            caption=html.escape(part.caption),
-            parse_mode=ParseMode.HTML,
+            caption=part.caption,
+            caption_entities=caption_entities,
+            parse_mode=None,
         )
     except asyncio.CancelledError:
         raise
@@ -160,8 +165,9 @@ async def _send_photo(
             fallback = await bot.send_photo(
                 group_id,
                 photo=BufferedInputFile(poster_bytes, filename=prepared.path.name),
-                caption=html.escape(part.caption),
-                parse_mode=ParseMode.HTML,
+                caption=part.caption,
+                caption_entities=caption_entities,
+                parse_mode=None,
             )
         except asyncio.CancelledError:
             raise
